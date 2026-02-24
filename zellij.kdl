@@ -1,0 +1,20 @@
+// 개발/테스트용 레이아웃
+layout {
+    pane size=1 borderless=true {
+        plugin location="zellij:tab-bar"
+    }
+
+    pane split_direction="vertical" {
+        pane size="60%" command="zsh" name="Shell"
+
+        pane size="40%" name="Dashboard" {
+            plugin location="file:target/wasm32-wasip1/release/claude_dashboard.wasm" {
+                claude_dir "/Users/miki/.claude"
+            }
+        }
+    }
+
+    pane size=1 borderless=true {
+        plugin location="zellij:status-bar"
+    }
+}
