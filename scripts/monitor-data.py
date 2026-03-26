@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""Monitor data collector for zellij-claude-monitor.
+
+Reads recent session data from JSONL files, calculates burn rate, cost, etc.
+and outputs as JSON for the Zellij WASM plugin to consume.
+
+Usage: python3 monitor-data.py <claude_dir> [plan]
+"""
+import json
+import sys
+import os
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# 모델별 가격 (per million tokens)
+PRICING = {
+    "opus": {"input": 15.0, "output": 75.0, "cache_creation": 18.75, "cache_read": 1.5},
+    "sonnet": {"input": 3.0, "output": 15.0, "cache_creation": 3.75, "cache_read": 0.3},
+    "haiku": {"input": 0.25, "output": 1.25, "cache_creation": 0.3, "cache_read": 0.03},
+}
+
+PLAN_LIMITS = {
+    "pro": {"tokens": 19_000, "cost": 18.0, "messages": 250},
+    "max5": {"tokens": 88_000, "cost": 35.0, "messages": 1_000},
+    "max20": {"tokens": 220_000, "cost": 140.0, "messages": 2_000},
+}
+
+
+def get_pricing(model: str) -> dict:
+    m = (model or "").lower()
+    if "opus" in m:
+        return PRICING["opus"]
+    if "haiku" in m:
+        return PRICING["haiku"]
+    return PRICING["sonnet"]
+
+
+def calc_cost(model: str, inp: int, out: int, cache_c: int, cache_r: int) -> float:
+    p = get_pricing(model)
+    return (
+        (inp / 1e6) * p["input"]
+        + (out / 1e6) * p["output"]
+        + (cache_c / 1e6) * p["cache_creation"]
+        + (cache_r / 1e6) * p["cache_read"]
+    )
+
+
+def parse_ts(ts_str: str):
+    try:
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def collect_teams(claude_dir: Path) -> list:
+    """팀 설정 + 태스크 상태를 수집한다."""
+    teams = []
+    teams_dir = claude_dir / "teams"
+    tasks_base = claude_dir / "tasks"
+
+    if not teams_dir.exists():
+        return []
+
+    for team_dir in sorted(teams_dir.iterdir()):
+        config_path = team_dir / "config.json"
+        if not config_path.exists():
+            continue
+
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+        except Exception:
+            continue
+
+        team_name = team_dir.name
+        members = []
+
+        # 해당 팀의 태스크 수집
+        task_map = {}  # owner -> list of task subjects
+        team_tasks_dir = tasks_base / team_name
+        task_counts = {"pending": 0, "in_progress": 0, "completed": 0}
+
+        if team_tasks_dir.exists():
+            for task_file in team_tasks_dir.glob("*.json"):
+                try:
+                    with open(task_file) as f:
+                        task = json.load(f)
+                    status = task.get("status", "")
+                    if status in task_counts:
+                        task_counts[status] += 1
+                    owner = task.get("owner", "")
+                    if owner and status == "in_progress":
+                        subject = task.get("subject", "")
+                        task_map.setdefault(owner, []).append(subject)
+                except Exception:
+                    continue
+
+        for member in config.get("members", []):
+            name = member.get("name", "")
+            agent_type = member.get("agentType", "")
+            current_tasks = task_map.get(name, [])
+            members.append({
+                "name": name,
+                "agent_type": agent_type,
+                "task": current_tasks[0] if current_tasks else "",
+                "busy": len(current_tasks) > 0,
+            })
+
+        teams.append({
+            "name": team_name,
+            "members": members,
+            "tasks_pending": task_counts["pending"],
+            "tasks_in_progress": task_counts["in_progress"],
+            "tasks_completed": task_counts["completed"],
+        })
+
+    return teams
+
+
+def detect_active_agents(projects_dir: Path, claude_dir: Path, now) -> list:
+    """최근 활성 서브에이전트의 타입을 감지한다.
+
+    부모 세션 JSONL이 최근에 수정되었고, Task tool_use 중
+    아직 tool_result를 받지 못한 것이 있으면 활성으로 판단한다.
+    """
+    active = set()
+    session_cutoff = now - timedelta(minutes=5)
+
+    if not projects_dir.exists():
+        return []
+
+    # 최근 수정된 세션 JSONL 중 subagents 폴더가 있는 것 찾기
+    active_sessions = []
+    for p in projects_dir.rglob("*.jsonl"):
+        # subagents/ 내 파일은 건너뛰기
+        if "subagents" in p.parts:
+            continue
+        try:
+            mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+            if mtime < session_cutoff:
+                continue
+            subagents_dir = p.with_suffix("") / "subagents"
+            if subagents_dir.exists():
+                active_sessions.append(p)
+        except OSError:
+            continue
+
+    # 각 세션에서 아직 결과를 받지 못한 Task의 subagent_type 수집
+    for session_jsonl in active_sessions:
+        for agent_type in find_pending_agents(session_jsonl):
+            active.add(agent_type)
+
+    # 팀 에이전트 중 실제 in_progress 태스크가 있는 것만 활성으로 판단
+    teams_dir = claude_dir / "teams"
+    tasks_base = claude_dir / "tasks"
+    if teams_dir.exists():
+        for config_path in teams_dir.glob("*/config.json"):
+            try:
+                with open(config_path) as f:
+                    config = json.load(f)
+                team_name = config_path.parent.name
+                # 해당 팀의 in_progress 태스크 owner 수집
+                busy_owners = set()
+                team_tasks_dir = tasks_base / team_name
+                if team_tasks_dir.exists():
+                    for task_file in team_tasks_dir.glob("*.json"):
+                        try:
+                            with open(task_file) as tf:
+                                task = json.load(tf)
+                            if task.get("status") == "in_progress":
+                                owner = task.get("owner", "")
+                                if owner:
+                                    busy_owners.add(owner)
+                        except Exception:
+                            continue
+                for member in config.get("members", []):
+                    name = member.get("name", "")
+                    at = member.get("agentType", "")
+                    if at and name in busy_owners:
+                        active.add(at)
+            except Exception:
+                continue
+
+    return sorted(active)
+
+
+def find_pending_agents(session_jsonl: Path) -> list:
+    """세션 JSONL에서 아직 결과를 받지 못한 Task의 subagent_type을 반환한다."""
+    task_uses = {}   # tool_use_id → subagent_type
+    task_results = set()  # tool_result를 받은 tool_use_id
+
+    try:
+        with open(session_jsonl, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                # Task/Agent tool_use 또는 tool_result가 포함된 줄만 파싱
+                has_task = '"Task"' in line or '"Agent"' in line
+                has_result = '"tool_result"' in line
+                if not has_task and not has_result:
+                    continue
+
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                msg = d.get("message", {})
+                content = msg.get("content", [])
+                if not isinstance(content, list):
+                    continue
+
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    # Task/Agent tool_use 수집
+                    if (has_task
+                            and block.get("name") in ("Task", "Agent")
+                            and block.get("type") == "tool_use"):
+                        tid = block.get("id", "")
+                        st = block.get("input", {}).get("subagent_type", "")
+                        if tid and st:
+                            task_uses[tid] = st
+                    # tool_result 수집
+                    if has_result and block.get("type") == "tool_result":
+                        tid = block.get("tool_use_id", "")
+                        if tid:
+                            task_results.add(tid)
+    except (OSError, PermissionError):
+        pass
+
+    # 결과를 아직 받지 못한 Task의 subagent_type 반환
+    return [st for tid, st in task_uses.items() if tid not in task_results]
+
+
+def find_current_window(entries: list, now, window_hours: int = 5):
+    """고정 윈도우 모델로 현재 활성 윈도우의 entries와 윈도우 종료 시각을 반환한다.
+
+    Anthropic rate limit: 첫 메시지의 시각을 시간 단위로 내림(floor)하여 윈도우 시작.
+    예: 15:54 시작 → 윈도우 15:00~20:00. 리셋 후 다음 메시지가 새 윈도우를 시작한다.
+
+    Returns:
+        (window_entries, window_end) — 활성 윈도우가 없으면 ([], None)
+    """
+    if not entries:
+        return [], None
+
+    # 첫 entry의 시각을 시간 단위로 내림 (Anthropic 윈도우 정렬 방식)
+    raw_start = entries[0]["ts"]
+    window_start = raw_start.replace(minute=0, second=0, microsecond=0)
+    while True:
+        window_end = window_start + timedelta(hours=window_hours)
+        if window_end > now:
+            # 현재 이 윈도우 안에 있음
+            window_entries = [e for e in entries if window_start <= e["ts"] < window_end]
+            return window_entries, window_end
+
+        # 이 윈도우는 만료됨 → 만료 후 첫 entry가 새 윈도우 시작
+        next_entries = [e for e in entries if e["ts"] >= window_end]
+        if not next_entries:
+            # 만료 후 사용 없음 → 완전히 리셋된 상태
+            return [], None
+        # 새 윈도우도 시간 단위 내림
+        raw_start = next_entries[0]["ts"]
+        window_start = raw_start.replace(minute=0, second=0, microsecond=0)
+
+
+def main():
+    claude_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/.claude")
+    plan = sys.argv[2] if len(sys.argv) > 2 else "max5"
+
+    projects_dir = Path(claude_dir) / "projects"
+    now = datetime.now(timezone.utc)
+    # 고정 윈도우 체인을 정확히 계산하려면 충분한 과거 데이터가 필요
+    # 5시간 윈도우 × 2 + 여유 = 12시간
+    cutoff = now - timedelta(hours=12)
+
+    entries = []
+
+    if projects_dir.exists():
+        for jsonl_path in projects_dir.rglob("*.jsonl"):
+            try:
+                mtime = datetime.fromtimestamp(jsonl_path.stat().st_mtime, tz=timezone.utc)
+                if mtime < cutoff:
+                    continue
+            except OSError:
+                continue
+
+            try:
+                with open(jsonl_path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            d = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        if d.get("type") != "assistant":
+                            continue
+
+                        ts_str = d.get("timestamp")
+                        if not ts_str:
+                            continue
+
+                        ts = parse_ts(ts_str)
+                        if not ts or ts < cutoff:
+                            continue
+
+                        msg = d.get("message", {})
+                        usage = msg.get("usage", {})
+                        if not usage:
+                            continue
+
+                        inp = usage.get("input_tokens", 0) or 0
+                        out = usage.get("output_tokens", 0) or 0
+                        cache_c = usage.get("cache_creation_input_tokens", 0) or 0
+                        cache_r = usage.get("cache_read_input_tokens", 0) or 0
+                        model = msg.get("model", "")
+
+                        cost = calc_cost(model, inp, out, cache_c, cache_r)
+                        total_tok = inp + out + cache_c + cache_r
+
+                        entries.append({
+                            "ts": ts,
+                            "tokens": total_tok,
+                            "cost": cost,
+                            "model": model,
+                            "out": out,
+                        })
+            except (OSError, PermissionError):
+                continue
+
+    entries.sort(key=lambda e: e["ts"])
+
+    # Plan limits — token limit은 output tokens 기준
+    limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["max5"])
+    local_tz = datetime.now().astimezone().tzinfo
+
+    # 고정 윈도우 모델: 첫 사용부터 5시간 윈도우, 만료 후 다음 사용이 새 윈도우 시작
+    session, window_end = find_current_window(entries, now)
+
+    total_all_tokens = sum(e["tokens"] for e in session)
+    total_cost = sum(e["cost"] for e in session)
+    total_out = sum(e["out"] for e in session)
+    msg_count = len(session)
+
+    # 모델별 output token 비중 + 현재 모델
+    model_out = {}
+    for e in session:
+        m = e.get("model", "") or ""
+        # 모델명 정규화: "claude-sonnet-4-..." → "Sonnet"
+        if "opus" in m.lower():
+            name = "Opus"
+        elif "haiku" in m.lower():
+            name = "Haiku"
+        else:
+            name = "Sonnet"
+        model_out[name] = model_out.get(name, 0) + e["out"]
+
+    model_breakdown = {}
+    if total_out > 0:
+        for name, out in model_out.items():
+            model_breakdown[name] = round(out / total_out * 100, 1)
+
+    current_model = ""
+    if session:
+        last_model = session[-1].get("model", "")
+        if "opus" in last_model.lower():
+            current_model = "Opus"
+        elif "haiku" in last_model.lower():
+            current_model = "Haiku"
+        else:
+            current_model = "Sonnet"
+
+    # Burn rate — output tokens 기준 (limit과 비교 가능하도록)
+    burn_rate = 0.0
+    cost_rate = 0.0
+    duration_min = 0.0
+    if session:
+        first_ts = session[0]["ts"]
+        duration_min = max((now - first_ts).total_seconds() / 60, 1.0)
+        burn_rate = total_out / duration_min
+        cost_rate = total_cost / duration_min
+
+    # 예측 — output tokens 기준
+    tokens_exhaust_min = -1.0
+    cost_exhaust_min = -1.0
+    if burn_rate > 0:
+        remaining_tok = max(limits["tokens"] - total_out, 0)
+        tokens_exhaust_min = remaining_tok / burn_rate
+    if cost_rate > 0:
+        remaining_cost = max(limits["cost"] - total_cost, 0)
+        cost_exhaust_min = remaining_cost / cost_rate
+
+    # 예상 소진 시각 (로컬 시간)
+    tokens_exhaust_at = ""
+    cost_exhaust_at = ""
+    if tokens_exhaust_min > 0:
+        exhaust_dt = now + timedelta(minutes=tokens_exhaust_min)
+        tokens_exhaust_at = exhaust_dt.astimezone(local_tz).strftime("%H:%M")
+    if cost_exhaust_min > 0:
+        exhaust_dt = now + timedelta(minutes=cost_exhaust_min)
+        cost_exhaust_at = exhaust_dt.astimezone(local_tz).strftime("%H:%M")
+
+    # 세션 리셋 시각 (로컬 시간) — 고정 윈도우 종료 시점
+    reset_time = ""
+    if window_end:
+        reset_time = window_end.astimezone(local_tz).strftime("%H:%M")
+
+    # Limit 초과 여부 — output tokens 기준 (실제 차단 기준)
+    exceeded_tokens = total_out >= limits["tokens"]
+
+    # 활성 에이전트 감지
+    active_agents = detect_active_agents(projects_dir, Path(claude_dir), now)
+
+    # 팀 정보 수집
+    teams = collect_teams(Path(claude_dir))
+
+    result = {
+        "burn_rate": round(burn_rate, 1),
+        "cost_rate": round(cost_rate, 4),
+        "total_tokens": total_out,
+        "total_all_tokens": total_all_tokens,
+        "total_cost": round(total_cost, 4),
+        "output_tokens": total_out,
+        "messages": msg_count,
+        "tokens_exhaust_min": round(tokens_exhaust_min, 0),
+        "cost_exhaust_min": round(cost_exhaust_min, 0),
+        "tokens_exhaust_at": tokens_exhaust_at,
+        "cost_exhaust_at": cost_exhaust_at,
+        "reset_time": reset_time,
+        "plan": plan,
+        "token_limit": limits["tokens"],
+        "cost_limit": limits["cost"],
+        "exceeded": exceeded_tokens,
+        "active": len(session) > 0,
+        "active_agents": active_agents,
+        "teams": teams,
+        "current_model": current_model,
+        "model_breakdown": model_breakdown,
+    }
+
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    main()

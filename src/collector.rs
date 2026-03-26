@@ -1,18 +1,20 @@
 use std::collections::BTreeMap;
 
-use crate::data::{AgentInfo, SkillInfo, StatsCacheJson, TodayStats};
+use crate::data::{AgentInfo, MonitorData, SessionInfo, SkillInfo, StatsCacheJson, TodayStats};
 use crate::state::DashboardState;
 use zellij_tile::prelude::*;
 
-/// 커맨드 식별용 컨텍스트 키
 const CMD_KEY: &str = "cmd";
-
-/// 커맨드 종류
 const CMD_AGENTS: &str = "agents";
 const CMD_STATS: &str = "stats";
-const CMD_TASKS: &str = "tasks";
+const CMD_SESSIONS: &str = "sessions";
+const CMD_MCPS: &str = "mcps";
 const CMD_SKILLS: &str = "skills";
 const CMD_DATE: &str = "date";
+const CMD_MONITOR: &str = "monitor";
+const CMD_SESSION: &str = "session";
+
+const TOTAL_COMMANDS: usize = 8;
 
 fn make_context(cmd: &str) -> BTreeMap<String, String> {
     let mut ctx = BTreeMap::new();
@@ -20,56 +22,84 @@ fn make_context(cmd: &str) -> BTreeMap<String, String> {
     ctx
 }
 
-/// 5개 run_command를 디스패치하고 pending_commands를 설정
 pub fn collect_data(state: &mut DashboardState) {
     let dir = &state.claude_dir;
     if dir.is_empty() {
         return;
     }
 
-    state.pending_commands = 5;
+    state.pending_commands = TOTAL_COMMANDS;
 
-    // 1. 에이전트 목록
     run_command(
         &["ls", "-1", &format!("{}/agents/", dir)],
         make_context(CMD_AGENTS),
     );
 
-    // 2. 통계 캐시
     run_command(
         &["cat", &format!("{}/stats-cache.json", dir)],
         make_context(CMD_STATS),
     );
 
-    // 3. 활성 태스크 (.lock 파일 수)
+    // 활성 세션 수 (5분 이내 수정된 JSONL)
     run_command(
         &[
             "find",
-            &format!("{}/tasks/", dir),
+            &format!("{}/projects/", dir),
             "-name",
-            "*.lock",
+            "*.jsonl",
+            "-not",
+            "-path",
+            "*/subagents/*",
+            "-mmin",
+            "-5",
             "-type",
             "f",
         ],
-        make_context(CMD_TASKS),
+        make_context(CMD_SESSIONS),
     );
 
-    // 4. 스킬 목록
+    // MCP 서버 수 (mcp.json에서 mcpServers 키 수 카운트)
+    run_command(
+        &[
+            "python3", "-c",
+            &format!(
+                "import json;f=open('{}/mcp.json');d=json.load(f);print(len(d.get('mcpServers',{{}})))",
+                dir
+            ),
+        ],
+        make_context(CMD_MCPS),
+    );
+
     run_command(
         &["ls", "-1", &format!("{}/skills/", dir)],
         make_context(CMD_SKILLS),
     );
 
-    // 5. 오늘 날짜
     run_command(&["date", "+%Y-%m-%d"], make_context(CMD_DATE));
+
+    // Session 데이터 (statusline.json)
+    run_command(
+        &["cat", &format!("{}/statusline.json", dir)],
+        make_context(CMD_SESSION),
+    );
+
+    // Monitor 데이터 수집 (Python 헬퍼 스크립트)
+    run_command(
+        &[
+            "python3",
+            &state.monitor_script,
+            &state.claude_dir,
+            &state.plan,
+        ],
+        make_context(CMD_MONITOR),
+    );
 }
 
-/// RunCommandResult 이벤트 처리. 모든 커맨드가 완료되면 true 반환
 pub fn handle_command_result(
     state: &mut DashboardState,
     exit_code: Option<i32>,
     stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    _stderr: Vec<u8>,
     context: BTreeMap<String, String>,
 ) -> bool {
     let cmd = match context.get(CMD_KEY) {
@@ -91,9 +121,8 @@ pub fn handle_command_result(
                 state.agents = output
                     .lines()
                     .filter(|l| !l.is_empty())
-                    .map(|l| {
-                        let name = l.trim_end_matches(".md").to_string();
-                        AgentInfo { name }
+                    .map(|l| AgentInfo {
+                        name: l.trim_end_matches(".md").to_string(),
                     })
                     .collect();
             } else {
@@ -107,11 +136,18 @@ pub fn handle_command_result(
                 state.stats = TodayStats::default();
             }
         }
-        CMD_TASKS => {
+        CMD_SESSIONS => {
             if success {
-                state.tasks_count = output.lines().filter(|l| !l.is_empty()).count();
+                state.active_sessions = output.lines().filter(|l| !l.is_empty()).count();
             } else {
-                state.tasks_count = 0;
+                state.active_sessions = 0;
+            }
+        }
+        CMD_MCPS => {
+            if success {
+                state.mcps_count = output.trim().parse::<usize>().unwrap_or(0);
+            } else {
+                state.mcps_count = 0;
             }
         }
         CMD_SKILLS => {
@@ -130,19 +166,23 @@ pub fn handle_command_result(
         CMD_DATE => {
             if success {
                 state.today_date = output.trim().to_string();
-                // 날짜 갱신 후 stats가 이미 로드되어 있으면 다시 매칭
-                if state.stats.sessions == 0 && !state.today_date.is_empty() {
-                    // stats 재파싱은 다음 사이클에서 수행
+            }
+        }
+        CMD_SESSION => {
+            if success {
+                if let Ok(info) = serde_json::from_str::<SessionInfo>(&output) {
+                    state.session = info;
+                }
+            }
+        }
+        CMD_MONITOR => {
+            if success {
+                if let Ok(data) = serde_json::from_str::<MonitorData>(&output) {
+                    state.monitor = data;
                 }
             }
         }
         _ => {}
-    }
-
-    // stderr에 permission 관련 에러가 있는지 확인
-    let err_output = String::from_utf8_lossy(&stderr);
-    if err_output.contains("Permission denied") || err_output.contains("permission") {
-        state.permission_error = true;
     }
 
     if state.pending_commands > 0 {
@@ -161,7 +201,6 @@ fn parse_stats(state: &mut DashboardState, json_str: &str) {
         state.stats.total_sessions = cache.total_sessions;
         state.stats.total_messages = cache.total_messages;
 
-        // 오늘 날짜와 매칭되는 활동 찾기
         if !state.today_date.is_empty() {
             if let Some(activity) = cache
                 .daily_activity
@@ -173,7 +212,6 @@ fn parse_stats(state: &mut DashboardState, json_str: &str) {
                 state.stats.tool_calls = activity.tool_call_count;
             }
 
-            // 오늘의 토큰 합산
             if let Some(tokens) = cache
                 .daily_model_tokens
                 .iter()

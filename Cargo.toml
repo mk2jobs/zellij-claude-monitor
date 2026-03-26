@@ -1,10 +1,12 @@
 [package]
-name = "claude-dashboard"
+name = "zellij-claude-monitor"
 version = "0.1.0"
 edition = "2021"
-
-[lib]
-crate-type = ["cdylib"]
+description = "A Zellij WASM plugin that monitors Claude Code usage — tokens, costs, burn rate, agents, and teams in real time"
+repository = "https://github.com/miki-saarna/zellij-claude-monitor"
+license = "MIT"
+keywords = ["zellij", "claude", "monitor", "wasm", "plugin"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 zellij-tile = "0.41.0"
