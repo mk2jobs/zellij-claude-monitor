@@ -177,90 +177,47 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
         lines.push(Line::new(&sep).color_all(0));
     }
 
-    // ── Monitor 섹션 ──
+    // ── 사용량 한도 섹션 (웹 스타일) ──
+    let tok_pct = if mon.token_limit > 0 {
+        (mon.total_tokens as f64 / mon.token_limit as f64 * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+    let cost_pct = if mon.cost_limit > 0.0 {
+        (mon.total_cost / mon.cost_limit * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+
+    // 세션/주간 한도 — 좌우 반반 한 줄
+    let reset = if mon.reset_time.is_empty() { "--:--".to_string() } else { mon.reset_time.clone() };
+    let half_w = w / 2;
+    let bar_width = half_w.saturating_sub(18).min(12);
+
+    let bar_color = if tok_pct >= 90.0 { 3 } else if tok_pct >= 70.0 { 4 } else { 2 };
+    let cost_bar_color = if cost_pct >= 90.0 { 3 } else if cost_pct >= 70.0 { 4 } else { 2 };
+
+    let sess_bar = draw_progress_bar(tok_pct, bar_width);
+    let left = format!(" Sess {} {:3.0}% {}", sess_bar, tok_pct, reset);
+
+    let cost_bar = draw_progress_bar(cost_pct, bar_width);
+    let right = format!("Week {} {:3.0}% Mon 10:00", cost_bar, cost_pct);
+
+    let combined = format!("{:<half$}{}", left, right, half = half_w);
+    let right_start = half_w;
+    lines.push(
+        Line::new(&combined)
+            .color(0, 1, 5)
+            .color(bar_color, 6, 6 + sess_bar.len() + 5)
+            .color(0, left.find(&reset).map(|p| p).unwrap_or(half_w), half_w)
+            .color(0, right_start, right_start + 4)
+            .color(cost_bar_color, right_start + 5, right_start + 5 + cost_bar.len() + 5)
+    );
+
     if mon.exceeded {
         let warn = " !! LIMIT EXCEEDED !!";
         lines.push(Line::new(warn).color_all(3));
     }
-
-    // Burn Rate + Cost Rate
-    let rate_line = format!(
-        " Burn: {} tok/min   Cost: {} /min",
-        fmt_rate(mon.burn_rate),
-        fmt_cost(mon.cost_rate),
-    );
-    let burn_pos = 1;
-    let burn_end = burn_pos + 4;
-    let burn_val_start = burn_end + 2; // after ": "
-    let burn_val_end = rate_line.find("tok/min").unwrap_or(burn_val_start);
-    let cost_pos = rate_line.find("Cost").unwrap_or(0);
-    let cost_val_start = cost_pos + 6; // after "Cost: "
-    let cost_val_end = rate_line.find("/min").unwrap_or(cost_val_start);
-    lines.push(
-        Line::new(&rate_line)
-            .color(6, burn_pos, burn_end)
-            .color(6, burn_val_start, burn_val_end)
-            .color(5, cost_pos, cost_pos + 4)
-            .color(5, cost_val_start, cost_val_end)
-    );
-
-    // Token / Cost usage — output tokens 기준
-    let tok_exceeded = mon.total_tokens >= mon.token_limit && mon.token_limit > 0;
-    let cost_exceeded = mon.total_cost >= mon.cost_limit && mon.cost_limit > 0.0;
-    let usage_line = format!(
-        " Tokens: {} / {}   Cost: {} / {}",
-        fmt_num(mon.total_tokens),
-        fmt_num(mon.token_limit),
-        fmt_cost(mon.total_cost),
-        fmt_cost(mon.cost_limit),
-    );
-    let tok_pos = usage_line.find("Tokens").unwrap_or(0);
-    // "Tokens: " 뒤의 값 영역
-    let tok_val_start = tok_pos + 8;
-    let cost2_pos = usage_line.rfind("Cost").unwrap_or(0);
-    let cost_val_start = cost2_pos + 6;
-    let tok_color = if tok_exceeded { 3 } else { 4 };
-    let cost_color = if cost_exceeded { 3 } else { 5 };
-    lines.push(
-        Line::new(&usage_line)
-            .color(tok_color, tok_pos, tok_pos + 6)
-            .color(tok_color, tok_val_start, cost2_pos.saturating_sub(3))
-            .color(cost_color, cost2_pos, cost2_pos + 4)
-            .color(cost_color, cost_val_start, usage_line.len())
-    );
-
-    // Predictions
-    let tok_exhaust = if mon.exceeded {
-        "exceeded".to_string()
-    } else if !mon.tokens_exhaust_at.is_empty() {
-        mon.tokens_exhaust_at.clone()
-    } else if mon.tokens_exhaust_min >= 0.0 {
-        fmt_minutes(mon.tokens_exhaust_min)
-    } else {
-        "--:--".to_string()
-    };
-    let cost_exhaust = if !mon.cost_exhaust_at.is_empty() {
-        mon.cost_exhaust_at.clone()
-    } else if mon.cost_exhaust_min >= 0.0 {
-        fmt_minutes(mon.cost_exhaust_min)
-    } else {
-        "--:--".to_string()
-    };
-    let reset = if mon.reset_time.is_empty() { "--:--".to_string() } else { mon.reset_time.clone() };
-    let pred_line = format!(" Exhaust: {} / {}  Reset: {}", tok_exhaust, cost_exhaust, reset);
-    let exhaust_pos = 1;
-    let exhaust_label_end = exhaust_pos + 7;
-    let exhaust_val_start = exhaust_label_end + 2;
-    let reset_pos = pred_line.find("Reset").unwrap_or(0);
-    let reset_val_start = reset_pos + 7;
-    let exhaust_color = if mon.exceeded { 3 } else { 4 };
-    lines.push(
-        Line::new(&pred_line)
-            .color(exhaust_color, exhaust_pos, exhaust_label_end)
-            .color(exhaust_color, exhaust_val_start, reset_pos.saturating_sub(2))
-            .color(2, reset_pos, reset_pos + 5)
-            .color(2, reset_val_start, pred_line.len())
-    );
 
     // 구분선
     lines.push(Line::new(&sep).color_all(0));
