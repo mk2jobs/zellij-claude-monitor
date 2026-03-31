@@ -11,37 +11,30 @@ fn fmt_num(n: u64) -> String {
     }
 }
 
-fn fmt_cost(c: f64) -> String {
-    if c >= 100.0 {
-        format!("${:.0}", c)
-    } else if c >= 1.0 {
-        format!("${:.2}", c)
-    } else {
-        format!("${:.4}", c)
-    }
-}
-
-fn fmt_rate(r: f64) -> String {
-    if r >= 1000.0 {
-        format!("{:.0}", r)
-    } else if r >= 1.0 {
-        format!("{:.1}", r)
-    } else {
-        format!("{:.4}", r)
-    }
-}
-
-/// 분을 시:분 형태로 변환
-fn fmt_minutes(min: f64) -> String {
-    if min < 0.0 {
+/// Unix timestamp → "HH:MM" (로컬 시간) 또는 남은 시간 표시
+fn format_reset_time(ts: i64) -> String {
+    if ts <= 0 {
         return "--:--".to_string();
     }
-    let h = min as u64 / 60;
-    let m = min as u64 % 60;
-    if h > 0 {
-        format!("{}h {}m", h, m)
+    // Unix timestamp에서 로컬 시간 추출
+    // Zellij WASM 환경에서는 chrono 없이 간단히 계산
+    let secs = ts;
+    // UTC offset은 환경에 따라 다르지만, 한국(KST=+9)을 기본으로
+    // 실제로는 시스템 시간과의 차이로 남은 시간을 표시
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let remaining_secs = secs - now;
+    if remaining_secs <= 0 {
+        return "reset".to_string();
+    }
+    let hours = remaining_secs / 3600;
+    let mins = (remaining_secs % 3600) / 60;
+    if hours > 0 {
+        format!("{}h{}m", hours, mins)
     } else {
-        format!("{}m", m)
+        format!("{}m", mins)
     }
 }
 
@@ -177,31 +170,27 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
         lines.push(Line::new(&sep).color_all(0));
     }
 
-    // ── 사용량 한도 섹션 (웹 스타일) ──
-    let tok_pct = if mon.token_limit > 0 {
-        (mon.total_tokens as f64 / mon.token_limit as f64 * 100.0).min(100.0)
-    } else {
-        0.0
-    };
-    let cost_pct = if mon.cost_limit > 0.0 {
-        (mon.total_cost / mon.cost_limit * 100.0).min(100.0)
-    } else {
-        0.0
-    };
+    // ── 사용량 한도 섹션 (statusline rate_limits 기반) ──
+    let rl = &state.session.rate_limits;
+    let sess_pct = rl.five_hour.used_percentage;
+    let week_pct = rl.seven_day.used_percentage;
+
+    // 리셋 시각 계산 (unix timestamp → HH:MM 로컬 시간)
+    let sess_reset = format_reset_time(rl.five_hour.resets_at);
+    let week_reset = format_reset_time(rl.seven_day.resets_at);
 
     // 세션/주간 한도 — 좌우 반반 한 줄
-    let reset = if mon.reset_time.is_empty() { "--:--".to_string() } else { mon.reset_time.clone() };
     let half_w = w / 2;
     let bar_width = half_w.saturating_sub(18).min(12);
 
-    let bar_color = if tok_pct >= 90.0 { 3 } else if tok_pct >= 70.0 { 4 } else { 2 };
-    let cost_bar_color = if cost_pct >= 90.0 { 3 } else if cost_pct >= 70.0 { 4 } else { 2 };
+    let bar_color = if sess_pct >= 90.0 { 3 } else if sess_pct >= 70.0 { 4 } else { 2 };
+    let week_bar_color = if week_pct >= 90.0 { 3 } else if week_pct >= 70.0 { 4 } else { 2 };
 
-    let sess_bar = draw_progress_bar(tok_pct, bar_width);
-    let left = format!(" Sess {} {:3.0}% {}", sess_bar, tok_pct, reset);
+    let sess_bar = draw_progress_bar(sess_pct, bar_width);
+    let left = format!(" Sess {} {:3.0}% {}", sess_bar, sess_pct, sess_reset);
 
-    let cost_bar = draw_progress_bar(cost_pct, bar_width);
-    let right = format!("Week {} {:3.0}% Mon 10:00", cost_bar, cost_pct);
+    let week_bar = draw_progress_bar(week_pct, bar_width);
+    let right = format!("Week {} {:3.0}% {}", week_bar, week_pct, week_reset);
 
     let combined = format!("{:<half$}{}", left, right, half = half_w);
     let right_start = half_w;
@@ -209,12 +198,12 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
         Line::new(&combined)
             .color(0, 1, 5)
             .color(bar_color, 6, 6 + sess_bar.len() + 5)
-            .color(0, left.find(&reset).map(|p| p).unwrap_or(half_w), half_w)
+            .color(0, left.find(&sess_reset).map(|p| p).unwrap_or(half_w), half_w)
             .color(0, right_start, right_start + 4)
-            .color(cost_bar_color, right_start + 5, right_start + 5 + cost_bar.len() + 5)
+            .color(week_bar_color, right_start + 5, right_start + 5 + week_bar.len() + 5)
     );
 
-    if mon.exceeded {
+    if sess_pct >= 100.0 || week_pct >= 100.0 {
         let warn = " !! LIMIT EXCEEDED !!";
         lines.push(Line::new(warn).color_all(3));
     }

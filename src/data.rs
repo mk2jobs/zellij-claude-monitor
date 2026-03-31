@@ -99,6 +99,22 @@ pub struct SessionWorkspace {
 }
 
 #[derive(Deserialize, Default, Clone, Debug)]
+pub struct RateLimitWindow {
+    #[serde(default)]
+    pub used_percentage: f64,
+    #[serde(default)]
+    pub resets_at: i64,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+pub struct RateLimits {
+    #[serde(default)]
+    pub five_hour: RateLimitWindow,
+    #[serde(default)]
+    pub seven_day: RateLimitWindow,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
 pub struct SessionInfo {
     #[serde(default)]
     pub session_id: String,
@@ -110,6 +126,8 @@ pub struct SessionInfo {
     pub workspace: SessionWorkspace,
     #[serde(default)]
     pub context_window: SessionContextWindow,
+    #[serde(default)]
+    pub rate_limits: RateLimits,
     #[serde(default)]
     pub version: String,
 }
