@@ -1,4 +1,4 @@
-use crate::data::{AgentInfo, MonitorData, SessionInfo, SkillInfo, TodayStats};
+use crate::data::{AgentInfo, MonitorData, SessionInfo, SkillInfo};
 
 #[derive(Default)]
 pub struct DashboardState {
@@ -16,8 +16,6 @@ pub struct DashboardState {
     pub mcps_count: usize,
     /// 스킬 목록
     pub skills: Vec<SkillInfo>,
-    /// 오늘의 통계
-    pub stats: TodayStats,
     /// 모니터 데이터 (burn rate, cost 등)
     pub monitor: MonitorData,
     /// 대기 중인 커맨드 수 (0이면 렌더 가능)

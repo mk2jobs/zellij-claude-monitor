@@ -1,31 +1,42 @@
 use crate::state::DashboardState;
 use zellij_tile::prelude::*;
 
-fn fmt_num(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
+/// 문자열의 문자 수 (Unicode 안전, color_range 위치 계산용)
+fn clen(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// 문자열에서 부분 문자열의 문자 위치를 반환
+fn cfind(s: &str, substr: &str) -> usize {
+    match s.find(substr) {
+        Some(byte_pos) => s[..byte_pos].chars().count(),
+        None => 0,
     }
 }
 
-/// Unix timestamp → "HH:MM" (로컬 시간) 또는 남은 시간 표시
+/// 문자열을 주어진 너비로 잘라서 말줄임 처리
+fn truncate(s: &str, max_w: usize) -> String {
+    if max_w == 0 {
+        return String::new();
+    }
+    let char_len: usize = s.chars().count();
+    if char_len <= max_w {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max_w.saturating_sub(1)).collect();
+    format!("{}…", truncated)
+}
+
+/// Unix timestamp → 남은 시간 표시
 fn format_reset_time(ts: i64) -> String {
     if ts <= 0 {
         return "--:--".to_string();
     }
-    // Unix timestamp에서 로컬 시간 추출
-    // Zellij WASM 환경에서는 chrono 없이 간단히 계산
-    let secs = ts;
-    // UTC offset은 환경에 따라 다르지만, 한국(KST=+9)을 기본으로
-    // 실제로는 시스템 시간과의 차이로 남은 시간을 표시
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let remaining_secs = secs - now;
+    let remaining_secs = ts - now;
     if remaining_secs <= 0 {
         return "reset".to_string();
     }
@@ -62,13 +73,17 @@ impl Line {
     }
 
     fn color(mut self, color: usize, start: usize, end: usize) -> Self {
-        self.colors.push((color, start, end));
+        if start < end {
+            self.colors.push((color, start, end));
+        }
         self
     }
 
     fn color_all(mut self, color: usize) -> Self {
         let len = self.text.len();
-        self.colors.push((color, 0, len));
+        if len > 0 {
+            self.colors.push((color, 0, len));
+        }
         self
     }
 
@@ -103,12 +118,10 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
     let mut lines: Vec<Line> = Vec::new();
 
     // ── 헤더 ──
-    let status = if mon.active { "● Active" } else { "○ Idle" };
     let plan_upper = state.plan.to_uppercase();
-    let header = format!(" {}  Claude Monitor [{}]  {}", status, plan_upper, state.today_date);
-    let status_end = 1 + status.len();
-    let header_color = if mon.active { 2 } else { 3 };
-    lines.push(Line::new(&header).color(header_color, 1, status_end));
+    let header_raw = format!("[{}] {}", plan_upper, state.today_date);
+    let header = format!(" {}", truncate(&header_raw, w.saturating_sub(1)));
+    lines.push(Line::new(&header).color_all(0));
 
     // 구분선
     lines.push(Line::new(&sep).color_all(0));
@@ -120,17 +133,18 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
             .collect();
         parts.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let breakdown: String = parts.iter()
-            .map(|(name, pct)| format!("{} {:.1}%", name, pct))
+            .map(|(name, pct)| format!("{} {:.0}%", name, pct))
             .collect::<Vec<_>>()
             .join(" | ");
 
-        let model_line = format!(" {}  {}", mon.current_model, breakdown);
-        let model_name_end = 1 + mon.current_model.len();
-        let breakdown_start = model_name_end + 2;
+        let model_raw = format!("{} | {}", mon.current_model, breakdown);
+        let model_line = format!(" {}", truncate(&model_raw, w.saturating_sub(1)));
+        let model_name_end = 1 + clen(&mon.current_model);
+        let model_line_cl = clen(&model_line);
         lines.push(
             Line::new(&model_line)
-                .color(2, 1, model_name_end)
-                .color(4, breakdown_start, model_line.len())
+                .color(2, 1, model_name_end.min(model_line_cl))
+                .color(4, model_name_end.min(model_line_cl), model_line_cl)
         );
     }
 
@@ -149,8 +163,9 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
             "session".to_string()
         };
 
-        let sess_line = format!(" {} | {}", sess.model.display_name, sess_name);
-        let model_end = 1 + sess.model.display_name.len();
+        let sess_raw = format!("{} | {}", sess.model.display_name, sess_name);
+        let sess_line = format!(" {}", truncate(&sess_raw, w.saturating_sub(1)));
+        let model_end = (1 + clen(&sess.model.display_name)).min(clen(&sess_line));
         lines.push(Line::new(&sess_line).color(1, 1, model_end));
 
         // Context usage progress bar
@@ -159,48 +174,46 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
         let bar = draw_progress_bar(pct, bar_width);
         let ctx_line = format!(" Context {} {:3.0}%", bar, pct);
         let color = if pct >= 80.0 { 3 } else if pct >= 50.0 { 4 } else { 2 };
-        let bar_start = 9;
         lines.push(
             Line::new(&ctx_line)
                 .color(0, 1, 9)
-                .color(color, bar_start, ctx_line.len())
+                .color(color, 9, clen(&ctx_line))
         );
-
-        // 구분선
-        lines.push(Line::new(&sep).color_all(0));
     }
 
-    // ── 사용량 한도 섹션 (statusline rate_limits 기반) ──
+    // 구분선
+    lines.push(Line::new(&sep).color_all(0));
+
+    // ── 사용량 한도 (Sess / Week 각각 한 줄) ──
     let rl = &state.session.rate_limits;
+
     let sess_pct = rl.five_hour.used_percentage;
-    let week_pct = rl.seven_day.used_percentage;
-
-    // 리셋 시각 계산 (unix timestamp → HH:MM 로컬 시간)
     let sess_reset = format_reset_time(rl.five_hour.resets_at);
-    let week_reset = format_reset_time(rl.seven_day.resets_at);
-
-    // 세션/주간 한도 — 좌우 반반 한 줄
-    let half_w = w / 2;
-    let bar_width = half_w.saturating_sub(18).min(12);
-
-    let bar_color = if sess_pct >= 90.0 { 3 } else if sess_pct >= 70.0 { 4 } else { 2 };
-    let week_bar_color = if week_pct >= 90.0 { 3 } else if week_pct >= 70.0 { 4 } else { 2 };
-
-    let sess_bar = draw_progress_bar(sess_pct, bar_width);
-    let left = format!(" Sess {} {:3.0}% {}", sess_bar, sess_pct, sess_reset);
-
-    let week_bar = draw_progress_bar(week_pct, bar_width);
-    let right = format!("Week {} {:3.0}% {}", week_bar, week_pct, week_reset);
-
-    let combined = format!("{:<half$}{}", left, right, half = half_w);
-    let right_start = half_w;
+    let sess_bar_color = if sess_pct >= 90.0 { 3 } else if sess_pct >= 70.0 { 4 } else { 2 };
+    let sess_bar_w = w.saturating_sub(22).min(20);
+    let sess_bar = draw_progress_bar(sess_pct, sess_bar_w);
+    let sess_line = format!(" Sess  {} {:3.0}%  {}", sess_bar, sess_pct, sess_reset);
+    let sess_line_t = truncate(&sess_line, w);
+    let sess_bar_start = 7;
+    let sess_bar_end = (7 + clen(&sess_bar) + 5).min(clen(&sess_line_t));
     lines.push(
-        Line::new(&combined)
-            .color(0, 1, 5)
-            .color(bar_color, 6, 6 + sess_bar.len() + 5)
-            .color(0, left.find(&sess_reset).map(|p| p).unwrap_or(half_w), half_w)
-            .color(0, right_start, right_start + 4)
-            .color(week_bar_color, right_start + 5, right_start + 5 + week_bar.len() + 5)
+        Line::new(&sess_line_t)
+            .color(6, 1, 5)
+            .color(sess_bar_color, sess_bar_start, sess_bar_end)
+    );
+
+    let week_pct = rl.seven_day.used_percentage;
+    let week_reset = format_reset_time(rl.seven_day.resets_at);
+    let week_bar_color = if week_pct >= 90.0 { 3 } else if week_pct >= 70.0 { 4 } else { 2 };
+    let week_bar = draw_progress_bar(week_pct, sess_bar_w);
+    let week_line = format!(" Week  {} {:3.0}%  {}", week_bar, week_pct, week_reset);
+    let week_line_t = truncate(&week_line, w);
+    let week_bar_start = 7;
+    let week_bar_end = (7 + clen(&week_bar) + 5).min(clen(&week_line_t));
+    lines.push(
+        Line::new(&week_line_t)
+            .color(5, 1, 5)
+            .color(week_bar_color, week_bar_start, week_bar_end)
     );
 
     if sess_pct >= 100.0 || week_pct >= 100.0 {
@@ -211,57 +224,27 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
     // 구분선
     lines.push(Line::new(&sep).color_all(0));
 
-    // ── Today / Total 통계 ──
-    let today_line = format!(
-        " Today  Sess: {}  Msg: {}  Tools: {}  Tok: {}",
-        state.stats.sessions,
-        fmt_num(state.stats.messages),
-        fmt_num(state.stats.tool_calls),
-        fmt_num(state.stats.tokens),
-    );
-    let today_sess_pos = today_line.find("Sess").unwrap_or(0);
-    let today_msg_pos = today_line.find("Msg").unwrap_or(0);
-    let today_tools_pos = today_line.find("Tools").unwrap_or(0);
-    let today_tok_pos = today_line.rfind("Tok").unwrap_or(0);
-    lines.push(
-        Line::new(&today_line)
-            .color(2, 1, 6)
-            .color(0, today_sess_pos, today_sess_pos + 4)
-            .color(0, today_msg_pos, today_msg_pos + 3)
-            .color(0, today_tools_pos, today_tools_pos + 5)
-            .color(0, today_tok_pos, today_tok_pos + 3)
-    );
-
-    let total_line = format!(
-        " Total  Sess: {}  Msg: {}",
-        fmt_num(state.stats.total_sessions),
-        fmt_num(state.stats.total_messages),
-    );
-    lines.push(Line::new(&total_line).color(0, 1, 6));
-
-    // 구분선
-    lines.push(Line::new(&sep).color_all(0));
-
-    // ── 카운트 요약 ──
-    let counts = format!(
-        " Agents: {}  Sessions: {}  MCPs: {}  Skills: {}",
+    // ── 카운트 요약 (줄임 처리) ──
+    let counts_raw = format!(
+        "Ag:{} Sess:{} MCP:{} Sk:{}",
         state.agents.len(),
         state.active_sessions,
         state.mcps_count,
         state.skills.len(),
     );
-    let agents_val_end = counts.find("  Sessions").unwrap_or(8);
-    let sess_pos = counts.find("Sessions").unwrap_or(0);
-    let sess_val_end = counts.find("  MCPs").unwrap_or(sess_pos + 8);
-    let mcps_pos = counts.find("MCPs").unwrap_or(0);
-    let mcps_val_end = counts.find("  Skills").unwrap_or(mcps_pos + 4);
-    let skills_pos = counts.find("Skills").unwrap_or(0);
+    let counts = format!(" {}", truncate(&counts_raw, w.saturating_sub(1)));
+
+    // 동적으로 색상 위치 계산
+    let ag_pos = cfind(&counts, "Ag:");
+    let sess_c_pos = cfind(&counts, "Sess:");
+    let mcp_pos = cfind(&counts, "MCP:");
+    let sk_pos = cfind(&counts, "Sk:");
     lines.push(
         Line::new(&counts)
-            .color(6, 1, agents_val_end)
-            .color(if state.active_sessions > 0 { 2 } else { 4 }, sess_pos, sess_val_end)
-            .color(5, mcps_pos, mcps_val_end)
-            .color(4, skills_pos, counts.len())
+            .color(6, ag_pos, sess_c_pos.max(ag_pos))
+            .color(if state.active_sessions > 0 { 2 } else { 4 }, sess_c_pos, mcp_pos.max(sess_c_pos))
+            .color(5, mcp_pos, sk_pos.max(mcp_pos))
+            .color(4, sk_pos, clen(&counts))
     );
 
     // ── 팀 섹션 ──
@@ -270,21 +253,21 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
 
         for team in &mon.teams {
             let total_tasks = team.tasks_pending + team.tasks_in_progress + team.tasks_completed;
-            let team_header = format!(
-                " Team: {}  [{}/{}/{}]",
+            let team_header_raw = format!(
+                "Team: {} [{}/{}/{}]",
                 team.name,
                 team.tasks_completed,
                 team.tasks_in_progress,
                 team.tasks_pending,
             );
-            let team_pos = 1;
-            let team_name_start = 7; // after "Team: "
-            let bracket_pos = team_header.find('[').unwrap_or(0);
+            let team_header = format!(" {}", truncate(&team_header_raw, w.saturating_sub(1)));
+            let team_header_cl = clen(&team_header);
+            let bracket_pos = cfind(&team_header, "[");
+            let bracket_pos = if bracket_pos == 0 && !team_header.contains('[') { team_header_cl } else { bracket_pos };
             lines.push(
                 Line::new(&team_header)
-                    .color(6, team_pos, team_pos + 4)
-                    .color(0, team_name_start, bracket_pos.saturating_sub(2))
-                    .color(if total_tasks > 0 { 2 } else { 0 }, bracket_pos, team_header.len())
+                    .color(6, 1, 5.min(team_header_cl))
+                    .color(if total_tasks > 0 { 2 } else { 0 }, bracket_pos, team_header_cl)
             );
 
             for member in &team.members {
@@ -292,17 +275,14 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
                 let task_info = if member.task.is_empty() {
                     String::new()
                 } else {
-                    let max_task_len = w.saturating_sub(member.name.len() + member.agent_type.len() + 10);
-                    let truncated = if member.task.len() > max_task_len {
-                        format!("{}…", &member.task[..max_task_len.saturating_sub(1)])
-                    } else {
-                        member.task.clone()
-                    };
+                    let max_task_len = w.saturating_sub(clen(&member.name) + clen(&member.agent_type) + 10);
+                    let truncated = truncate(&member.task, max_task_len);
                     format!(" → {}", truncated)
                 };
-                let member_line = format!(
-                    " {}{} ({}){}", prefix, member.name, member.agent_type, task_info
+                let member_raw = format!(
+                    "{}{} ({}){}", prefix, member.name, member.agent_type, task_info
                 );
+                let member_line = format!(" {}", truncate(&member_raw, w.saturating_sub(1)));
                 if member.busy {
                     lines.push(Line::new(&member_line).color_all(2));
                 } else {
@@ -318,28 +298,36 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
 
         let active_set: Vec<&str> = mon.active_agents.iter().map(|s| s.as_str()).collect();
 
+        // 활성 에이전트를 상단으로 정렬 (비활성은 원래 순서 유지)
+        let mut sorted_agents: Vec<&crate::data::AgentInfo> = state.agents.iter().collect();
+        sorted_agents.sort_by_key(|a| !active_set.contains(&a.name.as_str()));
+
         // 2열 레이아웃
         if w >= 36 {
             let col_w = w / 2;
+            let name_max = col_w.saturating_sub(3); // "○ " prefix + margin
             let mut i = 0;
-            while i < state.agents.len() {
-                let left_name = &state.agents[i].name;
+            while i < sorted_agents.len() {
+                let left_name = &sorted_agents[i].name;
                 let left_active = active_set.contains(&left_name.as_str());
                 let left_prefix = if left_active { "● " } else { "○ " };
-                let left = format!("{}{}", left_prefix, left_name);
+                let left_display = truncate(left_name, name_max);
+                let left = format!("{}{}", left_prefix, left_display);
 
-                if i + 1 < state.agents.len() {
-                    let right_name = &state.agents[i + 1].name;
+                if i + 1 < sorted_agents.len() {
+                    let right_name = &sorted_agents[i + 1].name;
                     let right_active = active_set.contains(&right_name.as_str());
                     let right_prefix = if right_active { "● " } else { "○ " };
-                    let right = format!("{}{}", right_prefix, right_name);
+                    let right_display = truncate(right_name, name_max);
+                    let right = format!("{}{}", right_prefix, right_display);
                     let line_str = format!("{:<width$}{}", left, right, width = col_w);
+                    let line_str_cl = clen(&line_str);
                     let mut line = Line::new(&line_str);
                     if left_active {
-                        line = line.color(2, 0, col_w.min(line_str.len()));
+                        line = line.color(2, 0, col_w.min(line_str_cl));
                     }
                     if right_active {
-                        line = line.color(2, col_w, line_str.len());
+                        line = line.color(2, col_w, line_str_cl);
                     }
                     lines.push(line);
                 } else {
@@ -352,10 +340,13 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
                 i += 2;
             }
         } else {
-            for agent in &state.agents {
+            // 1열 레이아웃
+            let name_max = w.saturating_sub(3);
+            for agent in &sorted_agents {
                 let is_active = active_set.contains(&agent.name.as_str());
                 let prefix = if is_active { "● " } else { "○ " };
-                let line_str = format!("{}{}", prefix, agent.name);
+                let display = truncate(&agent.name, name_max);
+                let line_str = format!("{}{}", prefix, display);
                 if is_active {
                     lines.push(Line::new(&line_str).color_all(2));
                 } else {
@@ -369,7 +360,6 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
     let total_lines = lines.len();
     state.content_height = total_lines;
 
-    // 스크롤 오프셋 클램핑 (콘텐츠가 화면보다 작으면 스크롤 불가)
     let max_scroll = if total_lines > rows { total_lines - rows } else { 0 };
     if state.scroll_offset > max_scroll {
         state.scroll_offset = max_scroll;
@@ -384,14 +374,13 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
         print_text_with_coordinates(line.to_text(), 0, screen_y, Some(w), None);
     }
 
-    // 스크롤 인디케이터 (콘텐츠가 화면보다 클 때)
+    // 스크롤 인디케이터
     if total_lines > rows {
         let indicator = format!(
             " [{}/{}] ↑k ↓j",
             offset + 1,
             total_lines.saturating_sub(rows) + 1,
         );
-        // 마지막 줄에 스크롤 힌트 오버레이
         let hint_y = rows.saturating_sub(1);
         let hint_x = w.saturating_sub(indicator.len());
         print_text_with_coordinates(

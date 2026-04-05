@@ -118,37 +118,53 @@ def collect_teams(claude_dir: Path) -> list:
 
 
 def detect_active_agents(projects_dir: Path, claude_dir: Path, now) -> list:
-    """최근 활성 서브에이전트의 타입을 감지한다.
+    """활성 서브에이전트를 감지한다.
 
-    부모 세션 JSONL이 최근에 수정되었고, Task tool_use 중
-    아직 tool_result를 받지 못한 것이 있으면 활성으로 판단한다.
+    1순위: subagents/ 디렉토리의 최근 수정 파일 + meta.json (agentType)
+    2순위: 부모 세션 JSONL의 Agent tool_use/tool_result 쌍 (fallback)
     """
     active = set()
     session_cutoff = now - timedelta(minutes=5)
+    agent_cutoff = now - timedelta(minutes=2)
+    tail_bytes = 32 * 1024
 
     if not projects_dir.exists():
         return []
 
-    # 최근 수정된 세션 JSONL 중 subagents 폴더가 있는 것 찾기
-    active_sessions = []
     for p in projects_dir.rglob("*.jsonl"):
-        # subagents/ 내 파일은 건너뛰기
         if "subagents" in p.parts:
             continue
         try:
-            mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+            stat = p.stat()
+            mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
             if mtime < session_cutoff:
                 continue
-            subagents_dir = p.with_suffix("") / "subagents"
-            if subagents_dir.exists():
-                active_sessions.append(p)
         except OSError:
             continue
 
-    # 각 세션에서 아직 결과를 받지 못한 Task의 subagent_type 수집
-    for session_jsonl in active_sessions:
-        for agent_type in find_pending_agents(session_jsonl):
-            active.add(agent_type)
+        # 1순위: subagents/ 디렉토리의 최근 수정 파일
+        subagents_dir = p.with_suffix("") / "subagents"
+        if subagents_dir.exists():
+            for sa_file in subagents_dir.glob("agent-*.jsonl"):
+                if "acompact" in sa_file.name:
+                    continue
+                try:
+                    sa_mtime = datetime.fromtimestamp(
+                        sa_file.stat().st_mtime, tz=timezone.utc
+                    )
+                    if sa_mtime < agent_cutoff:
+                        continue
+                    agent_type = _identify_agent_from_meta(sa_file)
+                    if agent_type:
+                        active.add(agent_type)
+                except OSError:
+                    continue
+
+        # 2순위: JSONL tail 파싱 (subagents/ 없는 세션 fallback)
+        try:
+            active.update(_parse_active_agents(p, stat.st_size, tail_bytes))
+        except (OSError, PermissionError):
+            continue
 
     # 팀 에이전트 중 실제 in_progress 태스크가 있는 것만 활성으로 판단
     teams_dir = claude_dir / "teams"
@@ -159,7 +175,6 @@ def detect_active_agents(projects_dir: Path, claude_dir: Path, now) -> list:
                 with open(config_path) as f:
                     config = json.load(f)
                 team_name = config_path.parent.name
-                # 해당 팀의 in_progress 태스크 owner 수집
                 busy_owners = set()
                 team_tasks_dir = tasks_base / team_name
                 if team_tasks_dir.exists():
@@ -184,55 +199,80 @@ def detect_active_agents(projects_dir: Path, claude_dir: Path, now) -> list:
     return sorted(active)
 
 
-def find_pending_agents(session_jsonl: Path) -> list:
-    """세션 JSONL에서 아직 결과를 받지 못한 Task의 subagent_type을 반환한다."""
-    task_uses = {}   # tool_use_id → subagent_type
-    task_results = set()  # tool_result를 받은 tool_use_id
+def _identify_agent_from_meta(sa_jsonl: Path) -> str:
+    """meta.json에서 agentType을 읽는다."""
+    meta_path = sa_jsonl.with_suffix(".meta.json")
+    if meta_path.exists():
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+            return meta.get("agentType", "")
+        except Exception:
+            pass
+    return ""
 
-    try:
-        with open(session_jsonl, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
 
-                # Task/Agent tool_use 또는 tool_result가 포함된 줄만 파싱
-                has_task = '"Task"' in line or '"Agent"' in line
-                has_result = '"tool_result"' in line
-                if not has_task and not has_result:
-                    continue
+def _parse_active_agents(jsonl_path: Path, file_size: int, tail_bytes: int) -> set:
+    """JSONL 파일의 tail에서 활성 Agent를 파싱한다.
 
-                try:
-                    d = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+    Agent tool_use (name="Agent") → 시작, tool_result (매칭 id) → 완료.
+    시작은 있지만 완료가 없는 Agent = 활성.
+    """
+    active = set()
+    agent_starts = {}  # tool_use_id -> subagent_type
+    completed_ids = set()
 
-                msg = d.get("message", {})
-                content = msg.get("content", [])
-                if not isinstance(content, list):
-                    continue
+    with open(jsonl_path, "rb") as f:
+        offset = max(0, file_size - tail_bytes)
+        f.seek(offset)
+        data = f.read().decode("utf-8", errors="ignore")
 
+    # offset > 0이면 첫 줄은 잘렸을 수 있으므로 버림
+    lines = data.splitlines()
+    if offset > 0 and lines:
+        lines = lines[1:]
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        rec_type = rec.get("type")
+
+        if rec_type == "assistant":
+            msg = rec.get("message", {})
+            content = msg.get("content", [])
+            if isinstance(content, list):
                 for block in content:
                     if not isinstance(block, dict):
                         continue
-                    # Task/Agent tool_use 수집
-                    if (has_task
-                            and block.get("name") in ("Task", "Agent")
-                            and block.get("type") == "tool_use"):
-                        tid = block.get("id", "")
-                        st = block.get("input", {}).get("subagent_type", "")
-                        if tid and st:
-                            task_uses[tid] = st
-                    # tool_result 수집
-                    if has_result and block.get("type") == "tool_result":
-                        tid = block.get("tool_use_id", "")
-                        if tid:
-                            task_results.add(tid)
-    except (OSError, PermissionError):
-        pass
+                    if block.get("type") == "tool_use" and block.get("name") == "Agent":
+                        inp = block.get("input", {})
+                        agent_type = inp.get("subagent_type", "") or inp.get("description", "")
+                        agent_starts[block["id"]] = agent_type
 
-    # 결과를 아직 받지 못한 Task의 subagent_type 반환
-    return [st for tid, st in task_uses.items() if tid not in task_results]
+        elif rec_type == "user":
+            msg = rec.get("message", {})
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_result":
+                        tid = block.get("tool_use_id", "")
+                        if tid in agent_starts:
+                            completed_ids.add(tid)
+
+    # 시작됐지만 완료 안 된 Agent = 활성
+    for tid, agent_type in agent_starts.items():
+        if tid not in completed_ids and agent_type:
+            active.add(agent_type)
+
+    return active
 
 
 def find_current_window(entries: list, now, window_hours: int = 5):

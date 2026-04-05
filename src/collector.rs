@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
-use crate::data::{AgentInfo, MonitorData, SessionInfo, SkillInfo, StatsCacheJson, TodayStats};
+use crate::data::{AgentInfo, MonitorData, SessionInfo, SkillInfo};
 use crate::state::DashboardState;
 use zellij_tile::prelude::*;
 
 const CMD_KEY: &str = "cmd";
 const CMD_AGENTS: &str = "agents";
-const CMD_STATS: &str = "stats";
+// CMD_STATS removed — Today/Total 통계 표시 제거
 const CMD_SESSIONS: &str = "sessions";
 const CMD_MCPS: &str = "mcps";
 const CMD_SKILLS: &str = "skills";
@@ -14,7 +14,7 @@ const CMD_DATE: &str = "date";
 const CMD_MONITOR: &str = "monitor";
 const CMD_SESSION: &str = "session";
 
-const TOTAL_COMMANDS: usize = 8;
+const TOTAL_COMMANDS: usize = 7;
 
 fn make_context(cmd: &str) -> BTreeMap<String, String> {
     let mut ctx = BTreeMap::new();
@@ -33,11 +33,6 @@ pub fn collect_data(state: &mut DashboardState) {
     run_command(
         &["ls", "-1", &format!("{}/agents/", dir)],
         make_context(CMD_AGENTS),
-    );
-
-    run_command(
-        &["cat", &format!("{}/stats-cache.json", dir)],
-        make_context(CMD_STATS),
     );
 
     // 활성 세션 수 (5분 이내 수정된 JSONL)
@@ -129,13 +124,7 @@ pub fn handle_command_result(
                 state.agents.clear();
             }
         }
-        CMD_STATS => {
-            if success {
-                parse_stats(state, &output);
-            } else {
-                state.stats = TodayStats::default();
-            }
-        }
+        // CMD_STATS removed
         CMD_SESSIONS => {
             if success {
                 state.active_sessions = output.lines().filter(|l| !l.is_empty()).count();
@@ -196,29 +185,4 @@ pub fn handle_command_result(
     state.pending_commands == 0
 }
 
-fn parse_stats(state: &mut DashboardState, json_str: &str) {
-    if let Ok(cache) = serde_json::from_str::<StatsCacheJson>(json_str) {
-        state.stats.total_sessions = cache.total_sessions;
-        state.stats.total_messages = cache.total_messages;
-
-        if !state.today_date.is_empty() {
-            if let Some(activity) = cache
-                .daily_activity
-                .iter()
-                .find(|a| a.date == state.today_date)
-            {
-                state.stats.sessions = activity.session_count;
-                state.stats.messages = activity.message_count;
-                state.stats.tool_calls = activity.tool_call_count;
-            }
-
-            if let Some(tokens) = cache
-                .daily_model_tokens
-                .iter()
-                .find(|t| t.date == state.today_date)
-            {
-                state.stats.tokens = tokens.tokens_by_model.values().sum();
-            }
-        }
-    }
-}
+// parse_stats removed — Today/Total 통계 표시 제거
