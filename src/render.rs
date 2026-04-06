@@ -40,9 +40,13 @@ fn format_reset_time(ts: i64) -> String {
     if remaining_secs <= 0 {
         return "reset".to_string();
     }
-    let hours = remaining_secs / 3600;
+    let total_hours = remaining_secs / 3600;
     let mins = (remaining_secs % 3600) / 60;
-    if hours > 0 {
+    let days = total_hours / 24;
+    let hours = total_hours % 24;
+    if days > 0 {
+        format!("{}d{}h", days, hours)
+    } else if hours > 0 {
         format!("{}h{}m", hours, mins)
     } else {
         format!("{}m", mins)
@@ -292,20 +296,20 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
         }
     }
 
-    // ── 에이전트 리스트 ──
+    // ── 에이전트 리스트 (●/○ 토글, 활성 상단 정렬) ──
     if !state.agents.is_empty() {
         lines.push(Line::new(&sep).color_all(0));
 
         let active_set: Vec<&str> = mon.active_agents.iter().map(|s| s.as_str()).collect();
 
-        // 활성 에이전트를 상단으로 정렬 (비활성은 원래 순서 유지)
+        // 활성 에이전트를 상단으로 정렬
         let mut sorted_agents: Vec<&crate::data::AgentInfo> = state.agents.iter().collect();
         sorted_agents.sort_by_key(|a| !active_set.contains(&a.name.as_str()));
 
         // 2열 레이아웃
         if w >= 36 {
             let col_w = w / 2;
-            let name_max = col_w.saturating_sub(3); // "○ " prefix + margin
+            let name_max = col_w.saturating_sub(3);
             let mut i = 0;
             while i < sorted_agents.len() {
                 let left_name = &sorted_agents[i].name;
@@ -340,7 +344,6 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
                 i += 2;
             }
         } else {
-            // 1열 레이아웃
             let name_max = w.saturating_sub(3);
             for agent in &sorted_agents {
                 let is_active = active_set.contains(&agent.name.as_str());

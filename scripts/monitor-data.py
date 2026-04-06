@@ -120,17 +120,36 @@ def collect_teams(claude_dir: Path) -> list:
 def detect_active_agents(projects_dir: Path, claude_dir: Path, now) -> list:
     """활성 서브에이전트를 감지한다.
 
-    1순위: subagents/ 디렉토리의 최근 수정 파일 + meta.json (agentType)
-    2순위: 부모 세션 JSONL의 Agent tool_use/tool_result 쌍 (fallback)
+    1순위: subagents/ JSONL 직접 스캔 (부모 세션 mtime 무관)
+    2순위: 부모 세션 JSONL의 미완료 Agent tool_use/tool_result 쌍
     """
     active = set()
     session_cutoff = now - timedelta(minutes=5)
     agent_cutoff = now - timedelta(minutes=2)
-    tail_bytes = 32 * 1024
+    tail_bytes = 128 * 1024
 
     if not projects_dir.exists():
         return []
 
+    # 1순위: 모든 subagent JSONL 직접 스캔 (부모 세션 mtime과 독립)
+    for sa_file in projects_dir.rglob("subagents/agent-*.jsonl"):
+        if "acompact" in sa_file.name:
+            continue
+        try:
+            sa_mtime = datetime.fromtimestamp(
+                sa_file.stat().st_mtime, tz=timezone.utc
+            )
+            if sa_mtime < agent_cutoff:
+                continue
+            agent_type = _identify_agent_from_meta(sa_file)
+            if agent_type:
+                active.add(agent_type)
+            else:
+                active.add("subagent")
+        except OSError:
+            continue
+
+    # 2순위: 최근 활성 부모 세션의 JSONL에서 미완료 Agent 호출 감지
     for p in projects_dir.rglob("*.jsonl"):
         if "subagents" in p.parts:
             continue
@@ -141,26 +160,6 @@ def detect_active_agents(projects_dir: Path, claude_dir: Path, now) -> list:
                 continue
         except OSError:
             continue
-
-        # 1순위: subagents/ 디렉토리의 최근 수정 파일
-        subagents_dir = p.with_suffix("") / "subagents"
-        if subagents_dir.exists():
-            for sa_file in subagents_dir.glob("agent-*.jsonl"):
-                if "acompact" in sa_file.name:
-                    continue
-                try:
-                    sa_mtime = datetime.fromtimestamp(
-                        sa_file.stat().st_mtime, tz=timezone.utc
-                    )
-                    if sa_mtime < agent_cutoff:
-                        continue
-                    agent_type = _identify_agent_from_meta(sa_file)
-                    if agent_type:
-                        active.add(agent_type)
-                except OSError:
-                    continue
-
-        # 2순위: JSONL tail 파싱 (subagents/ 없는 세션 fallback)
         try:
             active.update(_parse_active_agents(p, stat.st_size, tail_bytes))
         except (OSError, PermissionError):
@@ -488,4 +487,21 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        err_file = Path.home() / ".config" / "zellij" / "plugins" / "monitor-error.log"
+        with open(err_file, "w") as f:
+            traceback.print_exc(file=f)
+        # 에러 시에도 최소 JSON 출력 (WASM 파싱 실패 방지)
+        print(json.dumps({
+            "burn_rate": 0, "cost_rate": 0, "total_tokens": 0,
+            "total_all_tokens": 0, "total_cost": 0, "output_tokens": 0,
+            "messages": 0, "tokens_exhaust_min": 0, "cost_exhaust_min": 0,
+            "tokens_exhaust_at": "", "cost_exhaust_at": "",
+            "reset_time": "", "plan": "error", "token_limit": 0,
+            "cost_limit": 0, "exceeded": False, "active": False,
+            "active_agents": [f"ERR:{e}"], "teams": [],
+            "current_model": "", "model_breakdown": {},
+        }))

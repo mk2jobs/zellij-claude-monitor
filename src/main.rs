@@ -10,9 +10,36 @@ use zellij_tile::prelude::*;
 
 register_plugin!(DashboardState);
 
+/// WASI에서 HOME=/root 문제를 우회하여 실제 유저 홈 디렉토리를 찾는다.
+/// 1순위: 환경변수 HOME (/root이 아닌 경우)
+/// 2순위: /etc/passwd에서 현재 UID의 홈 디렉토리 파싱
+/// 3순위: /root (fallback)
+fn resolve_home() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() && home != "/root" {
+        return home;
+    }
+    // /etc/passwd에서 UID 501 (macOS 기본 유저) 또는 첫 번째 일반 유저의 홈 찾기
+    if let Ok(contents) = std::fs::read_to_string("/etc/passwd") {
+        for line in contents.lines() {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.len() >= 6 {
+                if let Ok(uid) = fields[2].parse::<u32>() {
+                    // macOS: UID >= 500, Linux: UID >= 1000
+                    if uid >= 500 && uid < 65534 {
+                        return fields[5].to_string();
+                    }
+                }
+            }
+        }
+    }
+    home
+}
+
 impl ZellijPlugin for DashboardState {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        // WASI 환경에서 HOME=/root이므로 /etc/passwd에서 실제 홈 디렉토리 추론
+        let home = resolve_home();
 
         self.claude_dir = configuration
             .get("claude_dir")
@@ -28,7 +55,8 @@ impl ZellijPlugin for DashboardState {
             .get("monitor_script")
             .cloned()
             .unwrap_or_else(|| {
-                format!("{}/.config/zellij/plugins/monitor-data.py", home)
+                let user_home = self.claude_dir.trim_end_matches("/.claude");
+                format!("{}/.config/zellij/plugins/monitor-data.py", user_home)
             });
 
         // 권한 요청
