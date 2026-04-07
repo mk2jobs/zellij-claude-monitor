@@ -318,58 +318,73 @@ def main():
 
     entries = []
 
+    # JSONL 파일에서 tail만 읽어 파싱 (대용량 파일 전체 읽기 방지)
+    tail_bytes = 512 * 1024  # 512KB — 최근 entries만 필요
+
     if projects_dir.exists():
         for jsonl_path in projects_dir.rglob("*.jsonl"):
             try:
-                mtime = datetime.fromtimestamp(jsonl_path.stat().st_mtime, tz=timezone.utc)
+                stat = jsonl_path.stat()
+                mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
                 if mtime < cutoff:
                     continue
             except OSError:
                 continue
 
             try:
-                with open(jsonl_path, encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            d = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
+                file_size = stat.st_size
+                with open(jsonl_path, "rb") as f:
+                    offset = max(0, file_size - tail_bytes)
+                    if offset > 0:
+                        f.seek(offset)
+                    raw = f.read().decode("utf-8", errors="ignore")
 
-                        if d.get("type") != "assistant":
-                            continue
+                lines = raw.splitlines()
+                # offset > 0이면 첫 줄은 잘렸을 수 있으므로 버림
+                if offset > 0 and lines:
+                    lines = lines[1:]
 
-                        ts_str = d.get("timestamp")
-                        if not ts_str:
-                            continue
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
 
-                        ts = parse_ts(ts_str)
-                        if not ts or ts < cutoff:
-                            continue
+                    if d.get("type") != "assistant":
+                        continue
 
-                        msg = d.get("message", {})
-                        usage = msg.get("usage", {})
-                        if not usage:
-                            continue
+                    ts_str = d.get("timestamp")
+                    if not ts_str:
+                        continue
 
-                        inp = usage.get("input_tokens", 0) or 0
-                        out = usage.get("output_tokens", 0) or 0
-                        cache_c = usage.get("cache_creation_input_tokens", 0) or 0
-                        cache_r = usage.get("cache_read_input_tokens", 0) or 0
-                        model = msg.get("model", "")
+                    ts = parse_ts(ts_str)
+                    if not ts or ts < cutoff:
+                        continue
 
-                        cost = calc_cost(model, inp, out, cache_c, cache_r)
-                        total_tok = inp + out + cache_c + cache_r
+                    msg = d.get("message", {})
+                    usage = msg.get("usage", {})
+                    if not usage:
+                        continue
 
-                        entries.append({
-                            "ts": ts,
-                            "tokens": total_tok,
-                            "cost": cost,
-                            "model": model,
-                            "out": out,
-                        })
+                    inp = usage.get("input_tokens", 0) or 0
+                    out = usage.get("output_tokens", 0) or 0
+                    cache_c = usage.get("cache_creation_input_tokens", 0) or 0
+                    cache_r = usage.get("cache_read_input_tokens", 0) or 0
+                    model = msg.get("model", "")
+
+                    cost = calc_cost(model, inp, out, cache_c, cache_r)
+                    total_tok = inp + out + cache_c + cache_r
+
+                    entries.append({
+                        "ts": ts,
+                        "tokens": total_tok,
+                        "cost": cost,
+                        "model": model,
+                        "out": out,
+                    })
             except (OSError, PermissionError):
                 continue
 
