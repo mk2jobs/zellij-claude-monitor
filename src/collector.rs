@@ -28,6 +28,11 @@ pub fn collect_data(state: &mut DashboardState) {
         return;
     }
 
+    // 이전 명령이 아직 실행 중이면 새 명령 spawn 차단 (프로세스 누적 방지)
+    if state.pending_commands > 0 {
+        return;
+    }
+
     state.pending_commands = TOTAL_COMMANDS;
 
     run_command(
