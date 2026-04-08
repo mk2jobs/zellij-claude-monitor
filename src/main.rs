@@ -94,6 +94,8 @@ impl ZellijPlugin for DashboardState {
             Event::PermissionRequestResult(permission) => {
                 if permission == PermissionStatus::Granted {
                     self.permission_error = false;
+                    // 권한 승인 후 narrow 체크 재시도 허용
+                    self.too_narrow = false;
                 } else {
                     self.permission_error = true;
                 }
