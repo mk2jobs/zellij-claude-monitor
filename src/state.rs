@@ -32,4 +32,6 @@ pub struct DashboardState {
     pub scroll_offset: usize,
     /// 전체 콘텐츠 높이 (마지막 렌더에서 계산)
     pub content_height: usize,
+    /// 패널 폭이 최소 기준 미달 시 비활성
+    pub too_narrow: bool,
 }

@@ -78,7 +78,9 @@ impl ZellijPlugin for DashboardState {
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::Timer(_) => {
-                collector::collect_data(self);
+                if !self.too_narrow {
+                    collector::collect_data(self);
+                }
                 // 5초 후 다음 갱신
                 set_timeout(5.0);
                 false
