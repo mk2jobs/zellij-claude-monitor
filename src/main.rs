@@ -60,7 +60,10 @@ impl ZellijPlugin for DashboardState {
             });
 
         // 권한 요청
-        request_permission(&[PermissionType::RunCommands]);
+        request_permission(&[
+            PermissionType::RunCommands,
+            PermissionType::ChangeApplicationState,
+        ]);
 
         // 이벤트 구독 (Key로 스크롤 지원)
         subscribe(&[
