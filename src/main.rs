@@ -60,10 +60,7 @@ impl ZellijPlugin for DashboardState {
             });
 
         // 권한 요청
-        request_permission(&[
-            PermissionType::RunCommands,
-            PermissionType::ChangeApplicationState,
-        ]);
+        request_permission(&[PermissionType::RunCommands]);
 
         // 이벤트 구독 (Key로 스크롤 지원)
         subscribe(&[
@@ -81,9 +78,7 @@ impl ZellijPlugin for DashboardState {
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::Timer(_) => {
-                if !self.too_narrow {
-                    collector::collect_data(self);
-                }
+                collector::collect_data(self);
                 // 5초 후 다음 갱신
                 set_timeout(5.0);
                 false
@@ -94,8 +89,6 @@ impl ZellijPlugin for DashboardState {
             Event::PermissionRequestResult(permission) => {
                 if permission == PermissionStatus::Granted {
                     self.permission_error = false;
-                    // 권한 승인 후 narrow 체크 재시도 허용
-                    self.too_narrow = false;
                 } else {
                     self.permission_error = true;
                 }

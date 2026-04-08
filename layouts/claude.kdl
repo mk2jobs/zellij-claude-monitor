@@ -6,25 +6,35 @@ layout {
         children
     }
 
-    // 기본 레이아웃: 우측 패널 (RIGHT PANEL)
+    // 기본 레이아웃: NONE (all stacked) — Claude Code가 포커스
     ui {
-        pane split_direction="vertical" {
-            pane size="65%" command="claude-session" name="Claude Code"
-            pane {
-                pane size="70%" name="Monitor" {
-                    plugin location="file:~/.config/zellij/plugins/zellij-claude-monitor.wasm" {
-                        plan "max5"
-                        _allow_exec_host_cmd true
-                    }
+        pane stacked=true {
+            pane command="claude-session" name="Claude Code" focus=true
+            pane name="Monitor" {
+                plugin location="file:~/.config/zellij/plugins/zellij-claude-monitor.wasm" {
+                    plan "max5"
+                    _allow_exec_host_cmd true
                 }
-                pane size="30%" name="Files" {
-                    plugin location="zellij:strider"
+            }
+            pane name="Files" {
+                plugin location="zellij:strider"
+            }
+        }
+    }
+
+    // Alt [ / Alt ] 로 전환: NONE → RIGHT → BOTTOM → NONE 순환
+    swap_tiled_layout name="RIGHT PANEL" {
+        ui max_panes=4 {
+            pane split_direction="vertical" {
+                pane size="65%"
+                pane {
+                    pane size="70%"
+                    pane size="30%"
                 }
             }
         }
     }
 
-    // Alt [ / Alt ] 로 전환: RIGHT → BOTTOM → NONE 순환
     swap_tiled_layout name="BOTTOM PANEL" {
         ui max_panes=4 {
             pane {
@@ -34,12 +44,6 @@ layout {
                     pane size="30%"
                 }
             }
-        }
-    }
-
-    swap_tiled_layout name="FOCUS" {
-        ui max_panes=4 {
-            pane stacked=true { pane; pane; pane; }
         }
     }
 }

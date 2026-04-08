@@ -101,17 +101,6 @@ impl Line {
 }
 
 pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
-    const MIN_COLS: usize = 50;
-    if cols < MIN_COLS {
-        if !state.too_narrow {
-            state.too_narrow = true;
-            // FOCUS(stacked) 레이아웃으로 전환 — 패널 접기
-            next_swap_layout();
-        }
-        return;
-    }
-    state.too_narrow = false;
-
     if !state.loaded {
         print_text_with_coordinates(Text::new(" Loading..."), 0, 0, None, None);
         return;
