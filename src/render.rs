@@ -114,7 +114,7 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
         return;
     }
 
-    const MIN_COLS: usize = 35;
+    const MIN_COLS: usize = 50;
     if cols < MIN_COLS {
         if !state.too_narrow {
             state.too_narrow = true;
