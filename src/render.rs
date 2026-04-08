@@ -106,7 +106,7 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
         if !state.too_narrow {
             state.too_narrow = true;
             // FOCUS(stacked) 레이아웃으로 전환 — 패널 접기
-            previous_swap_layout();
+            next_swap_layout();
         }
         return;
     }

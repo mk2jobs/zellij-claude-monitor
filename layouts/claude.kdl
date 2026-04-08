@@ -14,6 +14,7 @@ layout {
                 pane size="70%" name="Monitor" {
                     plugin location="file:~/.config/zellij/plugins/zellij-claude-monitor.wasm" {
                         plan "max5"
+                        _allow_exec_host_cmd true
                     }
                 }
                 pane size="30%" name="Files" {
