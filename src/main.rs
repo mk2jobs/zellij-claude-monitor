@@ -13,22 +13,33 @@ register_plugin!(DashboardState);
 /// WASI에서 HOME=/root 문제를 우회하여 실제 유저 홈 디렉토리를 찾는다.
 /// 1순위: 환경변수 HOME (/root이 아닌 경우)
 /// 2순위: /etc/passwd에서 현재 UID의 홈 디렉토리 파싱
-/// 3순위: /root (fallback)
+/// 3순위: macOS /Users/ 디렉토리에서 .claude 폴더가 있는 유저 홈 탐색
+/// 4순위: /root (fallback)
 fn resolve_home() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     if !home.is_empty() && home != "/root" {
         return home;
     }
-    // /etc/passwd에서 UID 501 (macOS 기본 유저) 또는 첫 번째 일반 유저의 홈 찾기
+    // /etc/passwd에서 일반 유저의 홈 찾기 (Linux)
     if let Ok(contents) = std::fs::read_to_string("/etc/passwd") {
         for line in contents.lines() {
             let fields: Vec<&str> = line.split(':').collect();
             if fields.len() >= 6 {
                 if let Ok(uid) = fields[2].parse::<u32>() {
-                    // macOS: UID >= 500, Linux: UID >= 1000
                     if uid >= 500 && uid < 65534 {
                         return fields[5].to_string();
                     }
+                }
+            }
+        }
+    }
+    // macOS: /Users/ 하위에서 .claude 디렉토리가 있는 유저 홈 탐색
+    if let Ok(entries) = std::fs::read_dir("/Users") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.join(".claude").is_dir() {
+                if let Some(s) = path.to_str() {
+                    return s.to_string();
                 }
             }
         }

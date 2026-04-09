@@ -13,6 +13,7 @@ layout {
             pane name="Monitor" {
                 plugin location="file:~/.config/zellij/plugins/zellij-claude-monitor.wasm" {
                     plan "max5"
+                    claude_dir "/Users/miki/.claude"
                     _allow_exec_host_cmd true
                 }
             }
