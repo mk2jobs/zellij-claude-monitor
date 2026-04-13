@@ -359,6 +359,79 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
         }
     }
 
+    // ── Zellij Sessions 섹션 ──
+    let total_sessions = state.zellij_sessions.len();
+    let dead_count = state.dead_sessions.len();
+    if total_sessions > 0 || dead_count > 0 {
+        if state.session_mode {
+            // 세션 모드: 전체 목록 표시
+            lines.push(Line::new(&sep).color_all(0));
+
+            let mode_hint = " [SESSION] s:exit ↑↓:nav ⏎:attach d:kill";
+            let hint_line = truncate(mode_hint, w);
+            lines.push(Line::new(&hint_line).color_all(4));
+
+            for (i, session) in state.zellij_sessions.iter().enumerate() {
+                let is_current = session.is_current_session;
+                let is_selected = i == state.selected_session;
+                let marker = if is_current { "●" } else { "○" };
+                let tabs = session.tabs.len();
+                let clients = session.connected_clients;
+
+                if is_selected {
+                    let sess_raw = format!(">> {} {} [{}t {}c] <<", marker, session.name, tabs, clients);
+                    let sess_line = truncate(&sess_raw, w);
+                    lines.push(Line::new(&sess_line).color_all(3));
+                } else {
+                    let sess_raw = format!("   {} {} [{}t {}c]", marker, session.name, tabs, clients);
+                    let sess_line = truncate(&sess_raw, w);
+                    if is_current {
+                        lines.push(Line::new(&sess_line).color_all(2));
+                    } else {
+                        lines.push(Line::new(&sess_line));
+                    }
+                }
+            }
+
+            // Dead (resurrectable) sessions
+            if dead_count > 0 {
+                let dead_header = format!(" dead --- ({})", dead_count);
+                lines.push(Line::new(&truncate(&dead_header, w)).color_all(0));
+
+                for (i, (name, duration)) in state.dead_sessions.iter().enumerate() {
+                    let ago_secs = duration.as_secs();
+                    let ago_str = if ago_secs >= 86400 {
+                        format!("{}d ago", ago_secs / 86400)
+                    } else if ago_secs >= 3600 {
+                        format!("{}h ago", ago_secs / 3600)
+                    } else {
+                        format!("{}m ago", ago_secs / 60)
+                    };
+                    let dead_idx = state.zellij_sessions.len() + i;
+                    let is_selected = dead_idx == state.selected_session;
+                    if is_selected {
+                        let dead_raw = format!(">> {} ({}) <<", name, ago_str);
+                        let dead_line = truncate(&dead_raw, w);
+                        lines.push(Line::new(&dead_line).color_all(3));
+                    } else {
+                        let dead_raw = format!("   {} ({})", name, ago_str);
+                        let dead_line = truncate(&dead_raw, w);
+                        lines.push(Line::new(&dead_line).color_all(0));
+                    }
+                }
+            }
+        } else {
+            // 일반 모드: 요약 한 줄만 표시
+            let sess_summary = if dead_count > 0 {
+                format!(" Sess:{} dead:{} (s:open)", total_sessions, dead_count)
+            } else {
+                format!(" Sess:{} (s:open)", total_sessions)
+            };
+            let summary_line = truncate(&sess_summary, w);
+            lines.push(Line::new(&summary_line).color_all(0));
+        }
+    }
+
     // ── 스크롤 적용 및 출력 ──
     let total_lines = lines.len();
     state.content_height = total_lines;

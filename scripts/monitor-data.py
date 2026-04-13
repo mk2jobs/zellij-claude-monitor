@@ -117,28 +117,23 @@ def collect_teams(claude_dir: Path) -> list:
     return teams
 
 
-def detect_active_agents(projects_dir: Path, claude_dir: Path, now) -> list:
-    """활성 서브에이전트를 감지한다.
+def detect_active_agents(
+    subagent_files: list, session_files: list, claude_dir: Path, now
+) -> list:
+    """사전 수집된 파일 리스트로 활성 서브에이전트를 감지한다.
 
-    1순위: subagents/ JSONL 직접 스캔 (부모 세션 mtime 무관)
-    2순위: 부모 세션 JSONL의 미완료 Agent tool_use/tool_result 쌍
+    subagent_files: (path, stat) 튜플 리스트 — subagents/ 하위 JSONL
+    session_files: (path, stat) 튜플 리스트 — 부모 세션 JSONL
     """
     active = set()
     session_cutoff = now - timedelta(minutes=5)
     agent_cutoff = now - timedelta(minutes=2)
     tail_bytes = 128 * 1024
 
-    if not projects_dir.exists():
-        return []
-
-    # 1순위: 모든 subagent JSONL 직접 스캔 (부모 세션 mtime과 독립)
-    for sa_file in projects_dir.rglob("subagents/agent-*.jsonl"):
-        if "acompact" in sa_file.name:
-            continue
+    # 1순위: subagent JSONL 직접 스캔
+    for sa_file, sa_stat in subagent_files:
         try:
-            sa_mtime = datetime.fromtimestamp(
-                sa_file.stat().st_mtime, tz=timezone.utc
-            )
+            sa_mtime = datetime.fromtimestamp(sa_stat.st_mtime, tz=timezone.utc)
             if sa_mtime < agent_cutoff:
                 continue
             agent_type = _identify_agent_from_meta(sa_file)
@@ -150,18 +145,15 @@ def detect_active_agents(projects_dir: Path, claude_dir: Path, now) -> list:
             continue
 
     # 2순위: 최근 활성 부모 세션의 JSONL에서 미완료 Agent 호출 감지
-    for p in projects_dir.rglob("*.jsonl"):
-        if "subagents" in p.parts:
-            continue
+    for p, st in session_files:
         try:
-            stat = p.stat()
-            mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+            mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
             if mtime < session_cutoff:
                 continue
         except OSError:
             continue
         try:
-            active.update(_parse_active_agents(p, stat.st_size, tail_bytes))
+            active.update(_parse_active_agents(p, st.st_size, tail_bytes))
         except (OSError, PermissionError):
             continue
 
@@ -318,21 +310,41 @@ def main():
 
     entries = []
 
-    # JSONL 파일에서 tail만 읽어 파싱 (대용량 파일 전체 읽기 방지)
+    # 1회 rglob으로 모든 JSONL 파일을 수집 후 분류하여 재사용
+    # (기존: main에서 1회 + detect_active_agents에서 2회 = 3회 rglob)
+    subagent_files = []  # (path, stat) — subagents/ 하위
+    session_files = []   # (path, stat) — 부모 세션 JSONL
+    active_session_count = 0  # 최근 5분 이내 활성 세션 수
+    session_cutoff_for_count = now - timedelta(minutes=5)
+
     tail_bytes = 512 * 1024  # 512KB — 최근 entries만 필요
 
     if projects_dir.exists():
         for jsonl_path in projects_dir.rglob("*.jsonl"):
             try:
-                stat = jsonl_path.stat()
-                mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-                if mtime < cutoff:
-                    continue
+                st = jsonl_path.stat()
+                mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
             except OSError:
                 continue
 
+            is_subagent = "subagents" in jsonl_path.parts
+
+            if is_subagent:
+                if "acompact" not in jsonl_path.name:
+                    subagent_files.append((jsonl_path, st))
+                continue
+
+            # 활성 세션 카운트 (5분 이내 수정된 부모 세션 JSONL)
+            if mtime >= session_cutoff_for_count:
+                active_session_count += 1
+
+            session_files.append((jsonl_path, st))
+
+            if mtime < cutoff:
+                continue
+
             try:
-                file_size = stat.st_size
+                file_size = st.st_size
                 with open(jsonl_path, "rb") as f:
                     offset = max(0, file_size - tail_bytes)
                     if offset > 0:
@@ -468,11 +480,24 @@ def main():
     # Limit 초과 여부 — output tokens 기준 (실제 차단 기준)
     exceeded_tokens = total_out >= limits["tokens"]
 
-    # 활성 에이전트 감지
-    active_agents = detect_active_agents(projects_dir, Path(claude_dir), now)
+    # 활성 에이전트 감지 (사전 수집된 파일 리스트 재사용)
+    active_agents = detect_active_agents(
+        subagent_files, session_files, Path(claude_dir), now
+    )
 
     # 팀 정보 수집
     teams = collect_teams(Path(claude_dir))
+
+    # MCP 서버 수 (mcp.json에서 mcpServers 키 수 카운트)
+    mcps_count = 0
+    mcp_json_path = Path(claude_dir) / "mcp.json"
+    if mcp_json_path.exists():
+        try:
+            with open(mcp_json_path) as f:
+                mcp_data = json.load(f)
+            mcps_count = len(mcp_data.get("mcpServers", {}))
+        except Exception:
+            pass
 
     result = {
         "burn_rate": round(burn_rate, 1),
@@ -496,6 +521,8 @@ def main():
         "teams": teams,
         "current_model": current_model,
         "model_breakdown": model_breakdown,
+        "active_sessions": active_session_count,
+        "mcps_count": mcps_count,
     }
 
     print(json.dumps(result))
@@ -519,4 +546,5 @@ if __name__ == "__main__":
             "cost_limit": 0, "exceeded": False, "active": False,
             "active_agents": [f"ERR:{e}"], "teams": [],
             "current_model": "", "model_breakdown": {},
+            "active_sessions": 0, "mcps_count": 0,
         }))

@@ -10,52 +10,13 @@ use zellij_tile::prelude::*;
 
 register_plugin!(DashboardState);
 
-/// WASI에서 HOME=/root 문제를 우회하여 실제 유저 홈 디렉토리를 찾는다.
-/// 1순위: 환경변수 HOME (/root이 아닌 경우)
-/// 2순위: /etc/passwd에서 현재 UID의 홈 디렉토리 파싱
-/// 3순위: macOS /Users/ 디렉토리에서 .claude 폴더가 있는 유저 홈 탐색
-/// 4순위: /root (fallback)
-fn resolve_home() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    if !home.is_empty() && home != "/root" {
-        return home;
-    }
-    // /etc/passwd에서 일반 유저의 홈 찾기 (Linux)
-    if let Ok(contents) = std::fs::read_to_string("/etc/passwd") {
-        for line in contents.lines() {
-            let fields: Vec<&str> = line.split(':').collect();
-            if fields.len() >= 6 {
-                if let Ok(uid) = fields[2].parse::<u32>() {
-                    if uid >= 500 && uid < 65534 {
-                        return fields[5].to_string();
-                    }
-                }
-            }
-        }
-    }
-    // macOS: /Users/ 하위에서 .claude 디렉토리가 있는 유저 홈 탐색
-    if let Ok(entries) = std::fs::read_dir("/Users") {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.join(".claude").is_dir() {
-                if let Some(s) = path.to_str() {
-                    return s.to_string();
-                }
-            }
-        }
-    }
-    home
-}
-
 impl ZellijPlugin for DashboardState {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
-        // WASI 환경에서 HOME=/root이므로 /etc/passwd에서 실제 홈 디렉토리 추론
-        let home = resolve_home();
-
+        // claude_dir: 설정에 명시되어 있으면 사용, 아니면 /Users/miki 하드코딩
         self.claude_dir = configuration
             .get("claude_dir")
             .cloned()
-            .unwrap_or_else(|| format!("{}/.claude", home));
+            .unwrap_or_else(|| "/Users/miki/.claude".to_string());
 
         self.plan = configuration
             .get("plan")
@@ -71,15 +32,20 @@ impl ZellijPlugin for DashboardState {
             });
 
         // 권한 요청
-        request_permission(&[PermissionType::RunCommands]);
+        request_permission(&[
+            PermissionType::RunCommands,
+            PermissionType::ReadApplicationState,
+            PermissionType::ChangeApplicationState,
+        ]);
 
-        // 이벤트 구독 (Key로 스크롤 지원)
+        // 이벤트 구독 (Key로 스크롤 지원, SessionUpdate로 세션 목록)
         subscribe(&[
             EventType::Timer,
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
             EventType::Key,
             EventType::Mouse,
+            EventType::SessionUpdate,
         ]);
 
         // 1초 후 첫 데이터 수집
@@ -90,9 +56,19 @@ impl ZellijPlugin for DashboardState {
         match event {
             Event::Timer(_) => {
                 collector::collect_data(self);
-                // 5초 후 다음 갱신
                 set_timeout(5.0);
                 false
+            }
+            Event::SessionUpdate(sessions, dead_sessions) => {
+                self.zellij_sessions = sessions;
+                self.dead_sessions = dead_sessions;
+                // 커서가 범위를 벗어나면 보정
+                let total = self.zellij_sessions.len() + self.dead_sessions.len();
+                if total > 0 && self.selected_session >= total {
+                    self.selected_session = total - 1;
+                }
+                // session_mode일 때만 즉시 렌더링 (일반 모드에서는 Timer 주기에 맡김)
+                self.session_mode
             }
             Event::RunCommandResult(exit_code, stdout, stderr, context) => {
                 collector::handle_command_result(self, exit_code, stdout, stderr, context)
@@ -106,47 +82,104 @@ impl ZellijPlugin for DashboardState {
                 true
             }
             Event::Key(key_with_mod) => {
-                let max_scroll = self.content_height.saturating_sub(1);
                 let bare = key_with_mod.bare_key;
-                match bare {
-                    BareKey::Down | BareKey::Char('j') => {
-                        if self.scroll_offset < max_scroll {
-                            self.scroll_offset += 1;
+
+                // 세션 모드일 때: 세션 탐색/선택/종료
+                if self.session_mode {
+                    let total = self.zellij_sessions.len() + self.dead_sessions.len();
+                    match bare {
+                        BareKey::Down | BareKey::Char('j') => {
+                            if total > 0 && self.selected_session < total - 1 {
+                                self.selected_session += 1;
+                            }
+                            true
                         }
-                        true
-                    }
-                    BareKey::Up | BareKey::Char('k') => {
-                        if self.scroll_offset > 0 {
-                            self.scroll_offset -= 1;
+                        BareKey::Up | BareKey::Char('k') => {
+                            if self.selected_session > 0 {
+                                self.selected_session -= 1;
+                            }
+                            true
                         }
-                        true
+                        BareKey::Enter => {
+                            // 활성 세션으로 전환
+                            if self.selected_session < self.zellij_sessions.len() {
+                                let name = &self.zellij_sessions[self.selected_session].name;
+                                if !self.zellij_sessions[self.selected_session].is_current_session {
+                                    switch_session(Some(name));
+                                }
+                            }
+                            true
+                        }
+                        BareKey::Char('d') | BareKey::Char('x') => {
+                            // 세션 종료 (현재 세션 제외)
+                            if self.selected_session < self.zellij_sessions.len() {
+                                let session = &self.zellij_sessions[self.selected_session];
+                                if !session.is_current_session {
+                                    kill_sessions(&[&session.name]);
+                                }
+                            } else {
+                                // dead session 삭제
+                                let dead_idx = self.selected_session - self.zellij_sessions.len();
+                                if dead_idx < self.dead_sessions.len() {
+                                    let name = &self.dead_sessions[dead_idx].0;
+                                    delete_dead_session(name);
+                                }
+                            }
+                            true
+                        }
+                        BareKey::Esc | BareKey::Char('s') | BareKey::Char('q') => {
+                            self.session_mode = false;
+                            true
+                        }
+                        _ => false,
                     }
-                    BareKey::PageDown | BareKey::Char(' ') => {
-                        self.scroll_offset = (self.scroll_offset + 10).min(max_scroll);
-                        true
-                    }
-                    BareKey::PageUp => {
-                        self.scroll_offset = self.scroll_offset.saturating_sub(10);
-                        true
-                    }
-                    BareKey::Home | BareKey::Char('g') => {
-                        self.scroll_offset = 0;
-                        true
-                    }
-                    BareKey::End => {
-                        self.scroll_offset = max_scroll;
-                        true
-                    }
-                    BareKey::Char('G') => {
-                        // Shift+g (대문자 G)
-                        if key_with_mod.key_modifiers.contains(&KeyModifier::Shift) {
+                } else {
+                    // 일반 모드: 스크롤
+                    let max_scroll = self.content_height.saturating_sub(1);
+                    match bare {
+                        BareKey::Char('s') => {
+                            // 세션 모드 진입
+                            self.session_mode = true;
+                            true
+                        }
+                        BareKey::Down | BareKey::Char('j') => {
+                            if self.scroll_offset < max_scroll {
+                                self.scroll_offset += 1;
+                            }
+                            true
+                        }
+                        BareKey::Up | BareKey::Char('k') => {
+                            if self.scroll_offset > 0 {
+                                self.scroll_offset -= 1;
+                            }
+                            true
+                        }
+                        BareKey::PageDown | BareKey::Char(' ') => {
+                            self.scroll_offset = (self.scroll_offset + 10).min(max_scroll);
+                            true
+                        }
+                        BareKey::PageUp => {
+                            self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                            true
+                        }
+                        BareKey::Home | BareKey::Char('g') => {
+                            self.scroll_offset = 0;
+                            true
+                        }
+                        BareKey::End => {
                             self.scroll_offset = max_scroll;
                             true
-                        } else {
-                            false
                         }
+                        BareKey::Char('G') => {
+                            if key_with_mod.key_modifiers.contains(&KeyModifier::Shift) {
+                                self.scroll_offset = max_scroll;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
                     }
-                    _ => false,
                 }
             }
             Event::Mouse(mouse) => {

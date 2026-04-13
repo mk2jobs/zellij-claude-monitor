@@ -5,20 +5,20 @@ use crate::state::DashboardState;
 use zellij_tile::prelude::*;
 
 const CMD_KEY: &str = "cmd";
+const GEN_KEY: &str = "gen";
 const CMD_AGENTS: &str = "agents";
-// CMD_STATS removed — Today/Total 통계 표시 제거
-const CMD_SESSIONS: &str = "sessions";
-const CMD_MCPS: &str = "mcps";
 const CMD_SKILLS: &str = "skills";
 const CMD_DATE: &str = "date";
 const CMD_MONITOR: &str = "monitor";
 const CMD_SESSION: &str = "session";
 
-const TOTAL_COMMANDS: usize = 7;
+/// 정적 데이터(agents, skills) 갱신 간격 (사이클 수, 5초 × 12 = 60초)
+const STATIC_REFRESH_INTERVAL: usize = 12;
 
-fn make_context(cmd: &str) -> BTreeMap<String, String> {
+fn make_context(cmd: &str, generation: usize) -> BTreeMap<String, String> {
     let mut ctx = BTreeMap::new();
     ctx.insert(CMD_KEY.to_string(), cmd.to_string());
+    ctx.insert(GEN_KEY.to_string(), generation.to_string());
     ctx
 }
 
@@ -28,62 +28,48 @@ pub fn collect_data(state: &mut DashboardState) {
         return;
     }
 
-    // 이전 명령이 아직 실행 중이면 새 명령 spawn 차단 (프로세스 누적 방지)
-    if state.pending_commands > 0 {
-        return;
+    // 새 세대 시작 — 이전 사이클의 in-flight 응답은 generation 불일치로 무시됨
+    state.generation = state.generation.wrapping_add(1);
+    let gen = state.generation;
+
+    // 이전 사이클이 미완료였으면 loaded 처리
+    if state.pending_commands > 0 && !state.loaded {
+        state.loaded = true;
     }
 
-    state.pending_commands = TOTAL_COMMANDS;
+    // 정적 데이터(agents, skills)는 STATIC_REFRESH_INTERVAL 사이클마다만 갱신
+    let refresh_static = state.static_refresh_counter == 0;
+    state.static_refresh_counter = (state.static_refresh_counter + 1) % STATIC_REFRESH_INTERVAL;
 
-    run_command(
-        &["ls", "-1", &format!("{}/agents/", dir)],
-        make_context(CMD_AGENTS),
-    );
+    // 동적 커맨드: date, session, monitor (항상 실행)
+    let mut cmd_count = 3;
+    if refresh_static {
+        cmd_count += 2; // agents, skills
+    }
+    state.pending_commands = cmd_count;
 
-    // 활성 세션 수 (5분 이내 수정된 JSONL)
-    run_command(
-        &[
-            "find",
-            &format!("{}/projects/", dir),
-            "-name",
-            "*.jsonl",
-            "-not",
-            "-path",
-            "*/subagents/*",
-            "-mmin",
-            "-5",
-            "-type",
-            "f",
-        ],
-        make_context(CMD_SESSIONS),
-    );
+    if refresh_static {
+        run_command(
+            &["ls", "-1", &format!("{}/agents/", dir)],
+            make_context(CMD_AGENTS, gen),
+        );
 
-    // MCP 서버 수 (mcp.json에서 mcpServers 키 수 카운트)
-    run_command(
-        &[
-            "python3", "-c",
-            &format!(
-                "import json;f=open('{}/mcp.json');d=json.load(f);print(len(d.get('mcpServers',{{}})))",
-                dir
-            ),
-        ],
-        make_context(CMD_MCPS),
-    );
+        run_command(
+            &["ls", "-1", &format!("{}/skills/", dir)],
+            make_context(CMD_SKILLS, gen),
+        );
+    }
 
-    run_command(
-        &["ls", "-1", &format!("{}/skills/", dir)],
-        make_context(CMD_SKILLS),
-    );
-
-    run_command(&["date", "+%Y-%m-%d"], make_context(CMD_DATE));
+    run_command(&["date", "+%Y-%m-%d"], make_context(CMD_DATE, gen));
 
     // Session 데이터 (statusline.json)
     run_command(
         &["cat", &format!("{}/statusline.json", dir)],
-        make_context(CMD_SESSION),
+        make_context(CMD_SESSION, gen),
     );
 
     // Monitor 데이터 수집 (Python 헬퍼 스크립트)
+    // active_sessions, mcps_count도 여기서 함께 반환
     run_command(
         &[
             "python3",
@@ -91,7 +77,7 @@ pub fn collect_data(state: &mut DashboardState) {
             &state.claude_dir,
             &state.plan,
         ],
-        make_context(CMD_MONITOR),
+        make_context(CMD_MONITOR, gen),
     );
 }
 
@@ -102,6 +88,15 @@ pub fn handle_command_result(
     _stderr: Vec<u8>,
     context: BTreeMap<String, String>,
 ) -> bool {
+    // 이전 사이클의 in-flight 응답은 무시
+    let ctx_gen: usize = context
+        .get(GEN_KEY)
+        .and_then(|g| g.parse().ok())
+        .unwrap_or(0);
+    if ctx_gen != state.generation {
+        return false;
+    }
+
     let cmd = match context.get(CMD_KEY) {
         Some(c) => c.as_str(),
         None => {
@@ -127,21 +122,6 @@ pub fn handle_command_result(
                     .collect();
             } else {
                 state.agents.clear();
-            }
-        }
-        // CMD_STATS removed
-        CMD_SESSIONS => {
-            if success {
-                state.active_sessions = output.lines().filter(|l| !l.is_empty()).count();
-            } else {
-                state.active_sessions = 0;
-            }
-        }
-        CMD_MCPS => {
-            if success {
-                state.mcps_count = output.trim().parse::<usize>().unwrap_or(0);
-            } else {
-                state.mcps_count = 0;
             }
         }
         CMD_SKILLS => {
@@ -172,6 +152,8 @@ pub fn handle_command_result(
         CMD_MONITOR => {
             if success {
                 if let Ok(data) = serde_json::from_str::<MonitorData>(&output) {
+                    state.active_sessions = data.active_sessions;
+                    state.mcps_count = data.mcps_count;
                     state.monitor = data;
                 }
             }

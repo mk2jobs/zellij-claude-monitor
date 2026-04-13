@@ -121,4 +121,8 @@ pub struct MonitorData {
     pub current_model: String,
     #[serde(default)]
     pub model_breakdown: std::collections::HashMap<String, f64>,
+    #[serde(default)]
+    pub active_sessions: usize,
+    #[serde(default)]
+    pub mcps_count: usize,
 }
