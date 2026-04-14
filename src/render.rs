@@ -185,48 +185,46 @@ pub fn draw_dashboard(state: &mut DashboardState, rows: usize, cols: usize) {
         );
     }
 
-    // 구분선
-    lines.push(Line::new(&sep).color_all(0));
-
-    // ── 사용량 한도 (Sess / Week 각각 한 줄) ──
-    let rl = &state.session.rate_limits;
-
-    let sess_pct = rl.five_hour.used_percentage;
-    let sess_reset = format_reset_time(rl.five_hour.resets_at);
-    let sess_bar_color = if sess_pct >= 90.0 { 3 } else if sess_pct >= 70.0 { 4 } else { 2 };
-    let sess_bar_w = w.saturating_sub(22).min(20);
-    let sess_bar = draw_progress_bar(sess_pct, sess_bar_w);
-    let sess_line = format!(" Sess  {} {:3.0}%  {}", sess_bar, sess_pct, sess_reset);
-    let sess_line_t = truncate(&sess_line, w);
-    let sess_bar_start = 7;
-    let sess_bar_end = (7 + clen(&sess_bar) + 5).min(clen(&sess_line_t));
-    lines.push(
-        Line::new(&sess_line_t)
-            .color(6, 1, 5)
-            .color(sess_bar_color, sess_bar_start, sess_bar_end)
-    );
-
-    let week_pct = rl.seven_day.used_percentage;
-    let week_reset = format_reset_time(rl.seven_day.resets_at);
-    let week_bar_color = if week_pct >= 90.0 { 3 } else if week_pct >= 70.0 { 4 } else { 2 };
-    let week_bar = draw_progress_bar(week_pct, sess_bar_w);
-    let week_line = format!(" Week  {} {:3.0}%  {}", week_bar, week_pct, week_reset);
-    let week_line_t = truncate(&week_line, w);
-    let week_bar_start = 7;
-    let week_bar_end = (7 + clen(&week_bar) + 5).min(clen(&week_line_t));
-    lines.push(
-        Line::new(&week_line_t)
-            .color(5, 1, 5)
-            .color(week_bar_color, week_bar_start, week_bar_end)
-    );
-
-    if sess_pct >= 100.0 || week_pct >= 100.0 {
-        let warn = " !! LIMIT EXCEEDED !!";
-        lines.push(Line::new(warn).color_all(3));
-    }
-
-    // 구분선
-    lines.push(Line::new(&sep).color_all(0));
+    // ── 사용량 한도 (Sess / Week) — 당분간 비활성화 ──
+    // lines.push(Line::new(&sep).color_all(0));
+    //
+    // let rl = &state.session.rate_limits;
+    //
+    // let sess_pct = rl.five_hour.used_percentage;
+    // let sess_reset = format_reset_time(rl.five_hour.resets_at);
+    // let sess_bar_color = if sess_pct >= 90.0 { 3 } else if sess_pct >= 70.0 { 4 } else { 2 };
+    // let sess_bar_w = w.saturating_sub(22).min(20);
+    // let sess_bar = draw_progress_bar(sess_pct, sess_bar_w);
+    // let sess_line = format!(" Sess  {} {:3.0}%  {}", sess_bar, sess_pct, sess_reset);
+    // let sess_line_t = truncate(&sess_line, w);
+    // let sess_bar_start = 7;
+    // let sess_bar_end = (7 + clen(&sess_bar) + 5).min(clen(&sess_line_t));
+    // lines.push(
+    //     Line::new(&sess_line_t)
+    //         .color(6, 1, 5)
+    //         .color(sess_bar_color, sess_bar_start, sess_bar_end)
+    // );
+    //
+    // let week_pct = rl.seven_day.used_percentage;
+    // let week_reset = format_reset_time(rl.seven_day.resets_at);
+    // let week_bar_color = if week_pct >= 90.0 { 3 } else if week_pct >= 70.0 { 4 } else { 2 };
+    // let week_bar = draw_progress_bar(week_pct, sess_bar_w);
+    // let week_line = format!(" Week  {} {:3.0}%  {}", week_bar, week_pct, week_reset);
+    // let week_line_t = truncate(&week_line, w);
+    // let week_bar_start = 7;
+    // let week_bar_end = (7 + clen(&week_bar) + 5).min(clen(&week_line_t));
+    // lines.push(
+    //     Line::new(&week_line_t)
+    //         .color(5, 1, 5)
+    //         .color(week_bar_color, week_bar_start, week_bar_end)
+    // );
+    //
+    // if sess_pct >= 100.0 || week_pct >= 100.0 {
+    //     let warn = " !! LIMIT EXCEEDED !!";
+    //     lines.push(Line::new(warn).color_all(3));
+    // }
+    //
+    // lines.push(Line::new(&sep).color_all(0));
 
     // ── 카운트 요약 (줄임 처리) ──
     let counts_raw = format!(

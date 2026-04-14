@@ -56,7 +56,7 @@ impl ZellijPlugin for DashboardState {
         match event {
             Event::Timer(_) => {
                 collector::collect_data(self);
-                set_timeout(5.0);
+                set_timeout(30.0);
                 false
             }
             Event::SessionUpdate(sessions, dead_sessions) => {
